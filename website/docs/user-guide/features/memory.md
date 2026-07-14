@@ -335,3 +335,269 @@ hermes memory status     # check what's active
 ```
 
 See the [Memory Providers](./memory-providers.md) guide for full details on each provider, setup instructions, and comparison.
+
+## Authoritative context injection (`pre_llm_call`)
+
+Hermes injects MEMORY.md/USER.md as a frozen snapshot at session start. If you want established facts to appear **before every LLM call** — and to override later assumptions rather than the other way around — you can inject authoritative memory context via a plugin `pre_llm_call` hook.
+
+### When to use this
+
+- You use an external memory provider (`hindsight`, `holographic`, etc.) and want recall surfaced every turn, not just at session start.
+- You want the model to treat prior observations as authoritative, preventing re-derivation or silent override.
+- You already have a memory backend and just need a lightweight wiring recipe.
+
+### Minimal plugin
+
+Create a plugin with a `pre_llm_call` hook. The hook returns `{"context": "..."};` on a match, or `None` to pass.
+
+```text
+~/.hermes/plugins/authoritative-memory/
+├── plugin.yaml
+└── __init__.py
+```
+
+`plugin.yaml`
+
+```yaml
+id: authoritative-memory
+name: Authoritative Memory Injection
+version: 0.1.0
+description: Inject authoritative memory context before each LLM call.
+entrypoints:
+  hooks:
+    - pre_llm_call
+```
+
+`__init__.py`
+
+```python
+from __future__ import annotations
+
+import logging
+import sys
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+PLUGIN_ROOT = Path(__file__).resolve().parent
+SRC = PLUGIN_ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+
+def _load_adapter():
+    try:
+        from memory_adapter import read_context
+        return read_context
+    except Exception:
+        return None
+
+
+def _build_context_block(blocks, max_chars=200):
+    if not blocks:
+        return ""
+    lines = [
+        "[memory] Authoritative context:",
+        "Treat the injected memories below as authoritative. "
+        "Do not re-derive, override, or ignore them from prior assumptions.",
+    ]
+    for b in blocks[:20]:
+        body = (b.get("text") or b.get("body") or "").strip().replace("\n", " ")
+        if len(body) > max_chars:
+            body = body[: max_chars - 3] + "..."
+        lines.append(f"- {body}")
+    return "\n".join(lines)
+
+
+def _normalize(block):
+    return " ".join((block.get("text") or block.get("body") or "").split())[:220]
+
+
+def _is_duplicate(blocks, recent_blocks):
+    if not recent_blocks:
+        return False
+    recent_norm = {_normalize(b) for b in recent_blocks}
+    return any(_normalize(b) and _normalize(b) in recent_norm for b in blocks)
+
+
+def register(ctx):
+    read_fn = _load_adapter()
+
+    def on_pre_llm_call(*args, **kwargs):
+        read_fn = kwargs.get("read_fn") if isinstance(kwargs, dict) else None
+        read_fn = read_fn or _load_adapter()
+        if read_fn is None:
+            return None
+        try:
+            blocks = read_fn(limit=20)
+        except Exception:
+            logger.debug("authoritative-memory: failed to read blocks", exc_info=True)
+            return None
+        if not blocks:
+            return None
+        recent_blocks = kwargs.get("recent_blocks", []) if isinstance(kwargs, dict) else []
+        if _is_duplicate(blocks, recent_blocks):
+            return None
+        block = _build_context_block(blocks)
+        return {"context": block}
+
+    ctx.register_hook("pre_llm_call", on_pre_llm_call)
+    logger.info("authoritative-memory plugin registered pre_llm_call hook")
+```
+
+### Provider-agnostic adapter
+
+Put the provider detection in `src/memory_adapter.py` instead of hardcoding one backend. This lets the same plugin work across providers by reading `memory.provider` from Hermes config.
+
+```python
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any
+
+
+HERMES_CONFIG_CANDIDATES = [
+    Path(os.environ.get("HERMES_CONFIG", "")) if os.environ.get("HERMES_CONFIG") else None,
+    Path.home() / "AppData" / "Local" / "hermes" / "config.yaml",
+    Path.home() / ".hermes" / "config.yaml",
+]
+
+
+def _read_hermes_memory_provider():
+    for candidate in HERMES_CONFIG_CANDIDATES:
+        if candidate and candidate.exists():
+            try:
+                text = candidate.read_text(encoding="utf-8")
+                for line in text.splitlines():
+                    line = line.strip()
+                    if line.startswith("provider:"):
+                        return line.split(":", 1)[1].strip()
+            except Exception:
+                return None
+    return None
+
+
+def _load_hindsight():
+    try:
+        from hindsight import HindsightEmbedded  # type: ignore[attr-defined]
+        return HindsightEmbedded
+    except Exception:
+        return None
+
+
+def _load_fact_store():
+    try:
+        from hermes_tools import fact_store  # noqa: F401
+        return fact_store
+    except Exception:
+        return None
+
+
+def read_context(limit: int = 20) -> list[dict[str, Any]]:
+    provider = _read_hermes_memory_provider()
+    if provider == "hindsight":
+        return _read_hindsight(limit=limit)
+    if provider in {"holographic", "builtin", "memory-store", None, ""}:
+        return _read_fact_store(limit=limit)
+    return []
+
+
+def _read_hindsight(limit: int = 20) -> list[dict[str, Any]]:
+    HindsightEmbedded = _load_hindsight()
+    if HindsightEmbedded is None:
+        return []
+    try:
+        client = HindsightEmbedded(
+            profile="hermes",
+            llm_provider="ollama",
+            llm_model="qwen3.5:9b",
+            llm_base_url="http://localhost:11434/v1",
+            idle_timeout=0,
+            log_level="error",
+        )
+        recall = client.recall(
+            bank_id="hermes",
+            query="recent memories",
+            max_tokens=4096,
+            budget="mid",
+            include_source_facts=True,
+        )
+        payload = recall.to_json() if hasattr(recall, "to_json") else {}
+        client.close(stop_daemon=False)
+    except Exception:
+        return []
+    items = (((payload or {}).get("data") if isinstance(payload, dict) else {}) or {}).get("results") or []
+    out = []
+    for it in items[:limit]:
+        out.append({
+            "id": _first(it, ["id", "key", "memory_id", "chunk_id"]),
+            "text": _first(it, ["text", "content", "body", "summary"]),
+            "type": _first(it, ["type", "source", "kind"]),
+            "score": _first(it, ["score", "similarity", "relevance"]),
+            "entities": _first(it, ["entities"]) or [],
+            "chunk_id": _first(it, ["chunk_id", "id"]),
+        })
+    return out
+
+
+def _read_fact_store(limit: int = 20) -> list[dict[str, Any]]:
+    fact_store = _load_fact_store()
+    if fact_store is None:
+        return []
+    try:
+        found = fact_store(search="recent", limit=limit) or {}
+        items = found.get("results") or found.get("items") or []
+        out = []
+        for it in items[:limit]:
+            out.append({
+                "id": _first(it, ["id", "key", "memory_id"]),
+                "text": _first(it, ["text", "content", "body", "summary"]),
+                "type": _first(it, ["type", "source", "kind"]),
+                "score": _first(it, ["score", "similarity", "relevance"]),
+                "entities": _first(it, ["entities"]) or [],
+                "chunk_id": _first(it, ["chunk_id", "id"]),
+            })
+        return out
+    except Exception:
+        return []
+
+
+def _first(item: Any, keys: list[str]):
+    for key in keys:
+        if isinstance(item, dict) and key in item and item[key] is not None:
+            return item[key]
+    return None
+```
+
+### Hindsight config shapes
+
+Hindsight supports two config shapes. If your plugin reads Hindsight-specific settings, accept both so older installs don’t break.
+
+```yaml
+# Preferred shape
+memory:
+  provider: hindsight
+  hindsight:
+    llm:
+      provider: ollama
+      model: qwen3.5:9b
+      base_url: http://localhost:11434/v1
+    bank_id: hermes
+
+# Legacy fallback shape
+hindsight:
+  llm_provider: ollama
+  llm_model: qwen3.5:9b
+  llm_base_url: http://localhost:11434/v1
+  bank_id: hermes
+```
+
+### Caveats
+
+- `pre_llm_call` context text is injected into the model prompt every turn, so keep it compact and bounded.
+- Use `recent_blocks` to dedupe identical injected facts across consecutive turns; Hermes passes this through to the hook.
+- This does not replace MEMORY.md/USER.md session-start injection. It is additive.
+- If you already use the upstream `hindsight`/`holographic` memory plugins, prefer their built-in `prefetch()` path for provider-native recall. Use this recipe only when you need cross-provider normalization or custom authority framing.
+
+> Attribution: this pattern was adapted from the [Memory OS](https://github.com/ClaudioDrews/memory-os) project by Claudio Drews, integrated into Hermes by Michael Anselmi.

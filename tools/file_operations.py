@@ -2773,7 +2773,7 @@ class ShellFileOperations(FileOperations):
         glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2795,7 +2795,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+            f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2815,7 +2815,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._escape_native_tool_arg(path)} "
+                f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -3047,7 +3047,10 @@ class ShellFileOperations(FileOperations):
         # Add pattern and path (path via _quote_rg_path: Windows-native rg
         # needs D:/... — the MSYS /d/... form yields os error 3).
         cmd_parts.append(self._escape_shell_arg(pattern))
-        cmd_parts.append(self._quote_rg_path(path))
+        # rg is a native Windows binary when installed via winget/cargo/choco:
+        # it needs the C:/... path form, not the MSYS /c/... form (which
+        # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
+        cmd_parts.append(self._escape_native_tool_arg(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,

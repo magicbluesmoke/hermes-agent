@@ -1,0 +1,12 @@
+name: wiki-commit-gate
+version: 0.1.0
+description: >
+  Require a matching wiki commit before a wiki-research board card can stay
+  done. Fires on kanban_task_completed; a card whose body carries no derivable
+  wiki reference (Wiki: line / .md page token / task id) or whose referenced
+  page is not committed in ~/wiki within the window is re-blocked with
+  guidance. Operator override: 'wiki-commit-gate: override <reason>'.
+author: agent
+kind: backend
+hooks:
+  - kanban_task_completed

@@ -1,0 +1,6 @@
+name: kanban-model-tracking
+version: 1.0.0
+description: "Record resolved_model into task_runs.metadata on kanban task dispatch — survive hermes updates. Hooks kanban_task_claimed to store the resolved model (profile default or per-task model_override) so model-usage statistics can be queried across all boards."
+author: Michael Anselmi
+hooks:
+  - kanban_task_claimed

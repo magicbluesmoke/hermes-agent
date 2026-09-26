@@ -1,0 +1,3 @@
+name: kanban-auto-commit
+description: "Auto-commit uncommitted changes in dir: workspace git repos after kanban task completion"
+version: 1.0.0

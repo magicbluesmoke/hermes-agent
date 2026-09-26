@@ -235,14 +235,12 @@ def select_target(goal: str, config: Optional[Dict[str, Any]] = None) -> Optiona
     when routing is disabled, no route matches, or a session cap is hit
     (in which case the configured fallback target is returned).
 
-    Classifier dispatch (2026-09-23): the ``complexity_routing.classifier``
-    field selects the engine:
-      - ``laya`` (default going forward): typed Choice(local/deepseek/delegate)
-        + confidence from the Laya RLCD head through ``laya_route_client``
-        (head shim :8091, backbone :8082). Decides the lane at P_max >= 0.55;
-        low confidence, rule violation, or head/schema failure all escalate to
-        the main lane (fallback target). Never retries.
-      - ``delegation-routing`` (legacy): keyword heuristic below.
+    Classifier dispatch (2026-09-23; laya RETIRED 2026-09-26):
+    the ``complexity_routing.classifier`` field selects the engine:
+      - ``laya`` (RETIRED 2026-09-26 — do not re-enable): typed
+        Choice(local/deepseek/delegate) + confidence from the Laya RLCD head.
+        Kept only as legacy code; classifier reverted to delegation-routing.
+      - ``delegation-routing`` (active default): keyword heuristic below.
 
     Route precedence (legacy path, matches the config design):
     - ``routes_moa`` first: high-complexity architecture/research/planning

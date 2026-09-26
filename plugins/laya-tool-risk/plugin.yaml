@@ -1,0 +1,5 @@
+name: laya-tool-risk
+version: 2.0.0
+description: "Tool-risk verifier — aux-router LLM (Qwen3.5-9B) gate on side-effect tool calls. Deterministic safe/catastrophic layers plus model verdicts: low/medium auto-allow, high auto-block; only ambiguity escalates to human. Targets >=95% auto decisions."
+author: michael-anselmi
+kind: standalone

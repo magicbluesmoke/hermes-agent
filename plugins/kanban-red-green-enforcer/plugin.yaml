@@ -1,0 +1,3 @@
+name: kanban-red-green-enforcer
+description: "Pre-verify hook that enforces RED-GREEN-REFACTOR discipline: workers must write the failing test BEFORE the code. Resurfaces the RULE line from the task body when tests are missing."
+version: 1.0.0

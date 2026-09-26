@@ -1,0 +1,3 @@
+name: spec-coverage
+description: "Pre-verify hook that nudges agents to update SPEC.md when source code changes touch areas covered by the spec. Maps changed files to SPEC.md sections so the nudge is targeted."
+version: 1.0.0

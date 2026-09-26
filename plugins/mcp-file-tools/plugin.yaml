@@ -1,0 +1,5 @@
+name: mcp-file-tools
+version: 1.0.0
+description: "Provides MCP-compatible file search and read tools for Hermes Agent"
+author: Hermes user
+kind: standalone

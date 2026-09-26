@@ -1,0 +1,6 @@
+name: kanban-review-gate
+description: Auto-request review for qualifying kanban tasks after completion.
+version: 1.0.0
+kind: backend
+hooks:
+  - kanban_task_completed

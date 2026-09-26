@@ -1,0 +1,6 @@
+name: kanban-recovery-hook
+description: Run kanban recovery scan on each dispatcher tick (cron-free replacement for kanban-recovery-watchdog + kanban-agent-recovery).
+version: 1.0.0
+kind: backend
+hooks:
+  - on_kanban_dispatch_tick

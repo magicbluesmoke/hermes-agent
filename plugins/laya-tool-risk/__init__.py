@@ -146,15 +146,31 @@ SIDE_EFFECT_TOOLS = {
 }
 
 # Pure read/inspection terminal commands: pass deterministically, never call the LLM.
+# Atomic tail: (?>...) commits to the first argument parse and never re-explores.
+# The original `(\s+([^>|;&]|'[^']*'|"[^"]*")*)?$` overlapped \s+ with the plain-char
+# class (whitespace) and blew up quadratically on commands with a long whitespace run
+# followed by a redirection/pipe/and char (ReDoS: one core pegged for hours, ~47s for
+# 50k spaces + '|'). Quoted regions are neutralized first (_STRIP_QUOTED) so pipes
+# inside quotes neither block the pass nor need backtracking; the catastrophic
+# patterns below still scan the ORIGINAL full display, so stripping cannot mask danger.
+_STRIP_QUOTED = re.compile(r"'[^']*'|\"[^\"]*\"")
 SAFE_TERMINAL_RE = re.compile(
-    r"^(ls|pwd|date|df|du|free|uptime|whoami|hostname|uname|env|printenv|which|type|"
+    r"^(?:ls|pwd|date|df|du|free|uptime|whoami|hostname|uname|env|printenv|which|type|"
     r"echo|cat|head|tail|grep|find|wc|sort|uniq|cut|tr|sed|awk|stat|file|tree|"
-    r"git\s+(status|diff|log|branch|remote\s+-v|config|show|rev-parse)\b|"
-    r"python3?\s+(\""
-    r"/home/michael/\.hermes/scripts/|~/.hermes/scripts/|\$HOME/.hermes/scripts/|\.hermes/scripts/)\""
+    r"git\s+(?:status|diff|log|branch|remote\s+-v|config|show|rev-parse)\b|"
+    r"python3?\s+(?:"
+    r"/home/michael/\.hermes/scripts/|~/.hermes/scripts/|\$HOME/.hermes/scripts/|\.hermes/scripts/)"
     r"\S+\.py\b)"
-    r"(\s+([^>|;&]|'[^']*'|\"[^\"]*\")*)?$"
+    r"(?>\s+(?:[^>|;&]+)*)?$"
 )
+
+
+def _is_safe_terminal(display: str) -> bool:
+    """Deterministic safe-pass: bare command + plain args, no redirection/chain."""
+    try:
+        return SAFE_TERMINAL_RE.match(_STRIP_QUOTED.sub("", display.strip())) is not None
+    except Exception:  # pragma: no cover - never gate on the matcher itself
+        return False
 
 # Deterministic catastrophic patterns: blocked before any model call. These are
 # destructive/irreversible/system-wide and never need a judgment round-trip.
@@ -314,7 +330,7 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
 
     # Deterministic layers first (no model round-trip).
     if tool_name == "terminal":
-        if SAFE_TERMINAL_RE.match(display.strip()):
+        if _is_safe_terminal(display):
             _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "allow",
                   "via": "safe-terminal-re"})
             return None

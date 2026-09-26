@@ -1,0 +1,200 @@
+"""kanban-completion-verify-gate plugin.
+
+Hooks ``kanban_task_completed`` and, for dir-workspace tasks that point at a
+git repo, re-runs the task's acceptance tests in the CANONICAL checkout. If
+tests fail the card is re-blocked; if they pass an evidence comment is added.
+
+The gate verifies against the canonical checkout (C:/src/realm-forge-game by
+default), never the worker's scratch/workspace copy, so a worker's self-report
+that doesn't match the tree is caught before the card closes.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+from pathlib import Path
+from typing import Any, Optional
+
+# Canonical checkout + its venv python.
+_CANONICAL_REPO = os.environ.get(
+    "REALM_FORGE_REPO",
+    "C:/src/realm-forge-game",
+)
+_CANONICAL_PYTHON = os.environ.get(
+    "REALM_FORGE_VENV_PYTHON",
+    os.path.join(_CANONICAL_REPO, ".venv", "Scripts", "python.exe"),
+)
+
+
+def _hermes_home() -> Path:
+    from hermes_constants import get_hermes_home as _ghh
+    return _ghh()
+
+
+def _board_db_path(board: Optional[str]) -> Path:
+    """Resolve a board name to its kanban.db path.
+
+    Mirrors kanban-auto-commit's resolution (which mirrors the core's
+    ``kanban_db_path``) so the plugin works in worker subprocesses
+    (profile-scoped HERMES_HOME) and the main agent process alike:
+
+    1. ``HERMES_KANBAN_DB`` env var -- injected by the dispatcher into worker
+       envs so the board is immune to path disagreements.
+    2. ``HERMES_HOME/kanban/boards/<slug>/kanban.db`` for named boards,
+       ``HERMES_HOME/kanban.db`` for the default board.
+    """
+    override = os.environ.get("HERMES_KANBAN_DB", "").strip()
+    if override:
+        return Path(override).expanduser()
+    home = _hermes_home()
+    if board and board.strip() and board.strip().lower() != "default":
+        return home / "kanban" / "boards" / board.strip() / "kanban.db"
+    return home / "kanban.db"
+
+
+def _detect_repo_root(workspace_path: Optional[str]) -> Optional[str]:
+    """Return the canonical checkout if present, else the workspace git repo.
+
+    The gate MUST verify against the canonical checkout, never the worker's
+    scratch copy. Fall back to the workspace only when the canonical path is
+    not a git repo (e.g. a non-Realm-Forge repo).
+    """
+    if os.path.isdir(os.path.join(_CANONICAL_REPO, ".git")):
+        return _CANONICAL_REPO
+    if workspace_path and os.path.isdir(os.path.join(workspace_path, ".git")):
+        return workspace_path
+    return None
+
+
+def _detect_test_target(task_body: str) -> str:
+    patterns = [
+        r"pytest\s+(?P<target>[^\s]+)",
+        r"run_qc\s+(?P<target>[^\s]+)",
+        r"verify:\s*(?P<target>.+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, task_body, re.IGNORECASE)
+        if m:
+            return m.group("target").strip()
+    return "tests"
+
+
+def _run_pytest(target: str, repo_root: str) -> dict:
+    cmd = [
+        _CANONICAL_PYTHON,
+        "-m",
+        "pytest",
+        target,
+        "-q",
+        "--tb=line",
+    ]
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=repo_root,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=900,
+        )
+        out = proc.stdout or ""
+        passed = failed = 0
+        m = re.search(r"(\d+)\s+passed", out)
+        if m:
+            passed = int(m.group(1))
+        m = re.search(r"(\d+)\s+failed", out)
+        if m:
+            failed = int(m.group(1))
+        return {
+            "returncode": proc.returncode,
+            "passed": passed,
+            "failed": failed,
+            "output": out[-8000:],
+        }
+    except Exception as exc:
+        return {
+            "returncode": 2,
+            "passed": 0,
+            "failed": 0,
+            "output": f"verify-gate error: {exc}",
+        }
+
+
+def _connect(board: Optional[str]):
+    """Open a connection to the task's board DB (threads board through)."""
+    from hermes_cli.kanban_db import connect
+    return connect(board=board)
+
+
+def _block_task(task_id: str, board: str, reason: str) -> None:
+    try:
+        from hermes_cli.kanban_db import block_task, connect
+        conn = connect(board=board or None)
+        try:
+            # Use the core transition so block_kind + block_recurrences stay
+            # consistent and the recurrence/triage loop-breaker applies.
+            # 'verify_gate' is not a VALID_BLOCK_KIND, so record it in the
+            # reason and use a generic typed block that lands in `blocked`.
+            block_task(conn, task_id, reason=reason, kind="needs_input")
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _comment_task(task_id: str, board: str, body: str, author: str = "verify-gate") -> None:
+    try:
+        from hermes_cli.kanban_db import add_comment, connect
+        conn = connect(board=board or None)
+        try:
+            add_comment(conn, task_id, author, body)
+        finally:
+            conn.close()
+    except Exception:
+        pass
+
+
+def on_kanban_task_completed(
+    task_id: str,
+    board: str = "",
+    assignee: str = "",
+    run_id: Optional[str] = None,
+    summary: Optional[str] = None,
+    workspace_path: Optional[str] = None,
+    task_body: Optional[str] = None,
+    **kwargs: Any,
+) -> None:
+    repo_root = _detect_repo_root(workspace_path)
+    if not repo_root:
+        return
+    target = _detect_test_target(task_body or "")
+    result = _run_pytest(target, repo_root)
+    evidence = (
+        f"verify-gate evidence\n"
+        f"- repo: {repo_root}\n"
+        f"- target: {target}\n"
+        f"- passed: {result['passed']}\n"
+        f"- failed: {result['failed']}\n"
+        f"- returncode: {result['returncode']}\n"
+        f"```\n{result['output']}\n```"
+    )
+    if result["failed"] > 0 or result["returncode"] != 0:
+        _block_task(
+            task_id,
+            board,
+            f"verify_gate: pytest failed target={target} failed={result['failed']} rc={result['returncode']}",
+        )
+        _comment_task(
+            task_id, board, evidence + "\n\nCard re-blocked by verify-gate."
+        )
+        return
+    _comment_task(task_id, board, evidence + "\n\nClosure verified.")
+
+
+def register(ctx: Any) -> None:
+    ctx.register_hook("kanban_task_completed", on_kanban_task_completed)

@@ -1,0 +1,10 @@
+name: kanban-completion-verify-gate
+version: 0.1.0
+description: >
+  Verify kanban task completion by re-running acceptance tests in the canonical
+  checkout. Fires on kanban_task_completed; failing tests block the card, passing
+  tests record evidence.
+author: agent
+kind: backend
+hooks:
+  - kanban_task_completed

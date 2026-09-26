@@ -1,0 +1,9 @@
+name: kanban-scratch-dir-guard
+description: >
+  Block completion of canonical-repo kanban tasks that were created with a
+  scratch workspace, enforcing dir:C:/src/realm-forge-game.
+version: 0.1.0
+author: agent
+kind: backend
+hooks:
+  - kanban_task_completed

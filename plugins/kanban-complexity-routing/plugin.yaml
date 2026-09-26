@@ -1,0 +1,8 @@
+name: kanban-complexity-routing
+version: 1.0.0
+description: "Automatic complexity-based model/preset routing for kanban tasks and agent delegations. Sets task.model_override on kanban claims and returns model/provider/preset overrides for delegate_task routing."
+author: Hermes user plugin
+kind: standalone
+provides_hooks:
+  - kanban_task_claimed
+  - delegate_task_routing

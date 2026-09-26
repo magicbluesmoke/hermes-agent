@@ -1,0 +1,7 @@
+name: web-defuddle
+version: 1.0.0
+description: "defuddle web extract provider — local CLI, no API key. Extracts article content to Markdown/HTML for server-rendered pages. Requires the defuddle CLI on PATH (~/.local/bin/defuddle)."
+author: Michael Anselmi
+kind: backend
+provides_web_providers:
+  - defuddle

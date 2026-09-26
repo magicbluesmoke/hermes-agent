@@ -1,0 +1,5 @@
+name: model-switch-tool
+version: 1.0.0
+description: "Exposes model_switch as an agent-callable tool for turn-scoped, session-scoped, or global model/provider switching. Wraps the built-in hermes_cli.model_switch module. Useful for complexity-based auto-escalation in the parent session."
+author: Hermes user plugin
+kind: standalone

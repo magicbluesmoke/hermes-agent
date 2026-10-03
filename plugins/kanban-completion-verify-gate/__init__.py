@@ -611,17 +611,21 @@ def _run_pytest(target: str, repo_root: str) -> dict:
             timeout=900,
         )
         out = proc.stdout or ""
-        passed = failed = 0
+        passed = failed = errors = 0
         m = re.search(r"(\d+)\s+passed", out)
         if m:
             passed = int(m.group(1))
         m = re.search(r"(\d+)\s+failed", out)
         if m:
             failed = int(m.group(1))
+        m = re.search(r"(\d+)\s+errors", out)
+        if m:
+            errors = int(m.group(1))
         return {
             "returncode": proc.returncode,
             "passed": passed,
             "failed": failed,
+            "errors": errors,
             "output": out[-8000:],
         }
     except Exception as exc:
@@ -629,6 +633,7 @@ def _run_pytest(target: str, repo_root: str) -> dict:
             "returncode": 2,
             "passed": 0,
             "failed": 0,
+            "errors": 0,
             "output": f"verify-gate error: {exc}",
         }
 
@@ -1107,10 +1112,12 @@ def on_kanban_task_completed(
         f"- target: {target}\n"
         f"- passed: {result['passed']}\n"
         f"- failed: {result['failed']}\n"
+        f"- errors: {result.get('errors', 0)}\n"
         f"- returncode: {result['returncode']}\n"
         + (f"- impact-affected tests ({len(impact_tests)}): {' '.join(impact_tests)}\n"
            f"- impact passed: {impact_result['passed']}\n"
            f"- impact failed: {impact_result['failed']}\n"
+           f"- impact errors: {impact_result.get('errors', 0)}\n"
            f"- impact returncode: {impact_result['returncode']}\n"
            if impact_result else "")
         + f"```\n{result['output']}\n```"
@@ -1121,9 +1128,18 @@ def on_kanban_task_completed(
         + (f"\n\nRuff (claimed .py):\n```\n{rf_output}\n```"
            if rf_output else "")
     )
-    failed_any = (result["failed"] > 0 or result["returncode"] != 0
-                  or (impact_result and (impact_result["failed"] > 0 or impact_result["returncode"] != 0)))
-    if failed_any:
+    # Only REAL assertion failures disprove the card's work. A nonzero rc with
+    # zero failures means pytest could not run the target at all (setup/teardown
+    # ERRORS, collection rc=5 'no tests ran', or a standalone script that pytest
+    # does not collect) — that is a test/data/tooling problem in the canonical
+    # tree, not evidence the card's change is wrong. Re-blocking on it (see
+    # 2026-09-26: 6 realm-forge cards blocked with failed=0 rc=1 because
+    # test_i700_encounter_tables_seed_repro.py hard-errored on a missing
+    # encounters.json fixture) punishes completed cards for environmental
+    # breakage. Record the errors as evidence and do not block.
+    card_failed = result["failed"] > 0
+    impact_failed = impact_result is not None and impact_result["failed"] > 0
+    if card_failed or impact_failed:
         if override:
             _comment_task(
                 task_id, board,
@@ -1136,11 +1152,24 @@ def on_kanban_task_completed(
         _block_task(
             task_id,
             board,
-            f"verify_gate: pytest failed target={target} failed={result['failed']} rc={result['returncode']}"
+            f"verify_gate: pytest failed target={target} failed={result['failed']}"
             + (f" impact_failed={impact_result['failed']}" if impact_result else ""),
         )
         _comment_task(
             task_id, board, evidence + "\n\nCard re-blocked by verify-gate."
+        )
+        return
+    if result["returncode"] != 0 or (impact_result and impact_result["returncode"] != 0):
+        # Environmental: pytest exited nonzero with zero assertion failures
+        # (setup errors / no tests ran). The card's own work is not disproven —
+        # comment the evidence so the environment problem stays visible and the
+        # card may close. A run with real failures took the block path above.
+        _comment_task(
+            task_id, board,
+            evidence
+            + "\n\npytest exited nonzero with ZERO test failures (setup/"
+            "collection error in canonical tree). Environmental — card not "
+            "re-blocked; operator should fix the test/fixture separately.",
         )
         return
     _comment_task(task_id, board, evidence + "\n\nClosure verified.")

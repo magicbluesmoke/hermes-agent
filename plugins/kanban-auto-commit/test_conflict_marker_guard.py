@@ -149,6 +149,9 @@ def test_blocks_auto_commit_with_conflict_markers(git_repo, tmp_path, monkeypatc
     conflict = repo / "conflicted.py"
     conflict.write_text("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> branch\n")
     subprocess.run(["git", "add", "conflicted.py"], cwd=repo, check=True)
+    # New scoping contract: the task declares its own files; without a
+    # declaration an untracked file is intentionally not swept in.
+    monkeypatch.setenv("KANBAN_AUTO_COMMIT_FILES", "conflicted.py")
 
     with caplog.at_level(logging.ERROR):
         pkg._auto_commit("t_test_marker", None)
@@ -172,6 +175,7 @@ def test_clean_staged_file_commits_through_guard(git_repo, tmp_path, monkeypatch
 
     (repo / "clean.py").write_text("def f():\n    return 1\n# === a comment\n")
     subprocess.run(["git", "add", "clean.py"], cwd=repo, check=True)
+    monkeypatch.setenv("KANBAN_AUTO_COMMIT_FILES", "clean.py")
 
     with caplog.at_level(logging.ERROR):
         pkg._auto_commit("t_test_clean", None)
@@ -195,6 +199,7 @@ def test_bare_equals_only_in_staged_file_does_not_block(git_repo, tmp_path, monk
 
     (repo / "doc.md").write_text("# Title\n=======\n\n| a | b |\n|---|---|\n| 1 | 2 |\n")
     subprocess.run(["git", "add", "doc.md"], cwd=repo, check=True)
+    monkeypatch.setenv("KANBAN_AUTO_COMMIT_FILES", "doc.md")
 
     with caplog.at_level(logging.ERROR):
         pkg._auto_commit("t_test_divider", None)

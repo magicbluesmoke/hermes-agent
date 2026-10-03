@@ -1,3 +1,10 @@
 name: kanban-auto-commit
 description: "Auto-commit uncommitted changes in dir: workspace git repos after kanban task completion"
 version: 1.0.0
+# Optional environment overrides (all read at commit time):
+#   KANBAN_AUTO_COMMIT_SPEC_ID          explicit I{NNN} to cite in the message
+#   KANBAN_AUTO_COMMIT_SPEC_ID_POLICY   "block" (default) | "commit"
+#                                        block = do not commit src/ changes
+#                                        without a resolvable spec ID
+#   KANBAN_AUTO_COMMIT_FILES            newline/comma-separated file scope,
+#                                        overriding the task's changed_files

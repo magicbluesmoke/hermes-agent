@@ -3,7 +3,7 @@
 Prevents canonical-repo content/code tasks from completing with a ``scratch``
 workspace. At task completion we inspect the task's persisted workspace:
 - repo-targeting tasks that are still scratch -> block completion with a clear
-  reason requiring dir:C:/src/realm-forge-game.
+  reason requiring dir:$REALM_FORGE_REPO (default ~/src/realm-forge-game).
 - non-repo or already-dir tasks -> allow.
 
 Why completion-time guard instead of create-time rewrite:
@@ -22,7 +22,7 @@ from typing import Any, Optional
 try:
     from hermes_constants import get_hermes_home as _get_hermes_home
 except Exception:
-    _get_hermes_home = lambda: Path.home() / "AppData" / "Local" / "hermes"
+    _get_hermes_home = lambda: Path.home() / ".hermes"
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +31,9 @@ HERMES_HOME = (
 )
 KANBAN_HOME = HERMES_HOME / "kanban"
 
-_CANONICAL_REPO = os.environ.get("REALM_FORGE_REPO", "C:/src/realm-forge-game")
+_CANONICAL_REPO = os.environ.get("REALM_FORGE_REPO") or str(
+    Path.home() / "src" / "realm-forge-game"
+)
 _REPO_SLUGS = (
     "realm-forge",
     "realm_forge",

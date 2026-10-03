@@ -1,0 +1,7 @@
+name: tool-result-local-condenser
+version: 1.0.0
+description: "Condense large tool results (>= 8000 chars) via the local aux model before they enter context. Full original saved under scratch for read_file access."
+author: Michael Anselmi
+kind: standalone
+provides_hooks:
+  - transform_tool_result

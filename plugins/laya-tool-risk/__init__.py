@@ -1,12 +1,18 @@
-"""laya-tool-risk plugin v2: pre_tool_call risk gate backed by the aux router LLM.
+"""laya-tool-risk plugin v2.1: pre_tool_call risk gate backed by the aux router LLM.
 
 Every side-effect tool call (terminal, write_file, patch, execute_code, browser, ...)
-is classified by the aux router (:8082, model aux-coding = Qwen3.5-9B) through a
+is classified by the aux router (:8082, model aux-coding-maxfit = Qwen3.5-9B) through a
 strict JSON rubric. Read-only tools and safe inspection commands pass deterministically
 (zero latency, zero false positives). Catastrophic patterns are blocked deterministically
 BEFORE any model call. Model verdicts: low/medium -> auto-ALLOW, high -> auto-BLOCK.
 Only verifier outage or a malformed model response escalates to the human approval gate
 (fail-to-REVIEW, rare).
+
+Failover chain (v2.1): local aux router -> main-profile default model (paid OpenRouter)
+-> free-tier model (config fallback_providers, e.g. gemma free) -> human gate. A router
+health probe splits OUTAGE (fail over immediately) from COLD START after idle eviction
+(one 120s retry before failover). Every attempt and error reason is recorded in the
+decisions.jsonl entry so outages are diagnosable from the log alone.
 
 Return shapes (matched against _get_pre_tool_call_directive_details on this install):
   None                                  -> allow
@@ -50,6 +56,14 @@ LOG_PATH = os.environ.get(
 FALLBACK_URL_ENV = os.environ.get("LAYA_FALLBACK_URL", "")
 FALLBACK_MODEL_ENV = os.environ.get("LAYA_FALLBACK_MODEL", "")
 FALLBACK_TIMEOUT_S = float(os.environ.get("LAYA_FALLBACK_TIMEOUT", "25.0"))
+# Cold-start split: when the router master is UP but a request times out, the
+# worker is likely reloading after idle eviction (40-90s on this box) — give it
+# ONE long retry before failing over. Health probe timeout is deliberately short.
+COLD_START_TIMEOUT_S = float(os.environ.get("LAYA_COLD_START_TIMEOUT", "120.0"))
+HEALTH_TIMEOUT_S = float(os.environ.get("LAYA_HEALTH_TIMEOUT", "2.0"))
+# Free-tier (third) model: env override > config fallback_providers > bundled.
+FREE_FALLBACK_MODEL_ENV = os.environ.get("LAYA_FREE_FALLBACK_MODEL", "")
+_DEFAULT_FREE_FALLBACK_MODEL = "google/gemma-4-26b-a4b-it:free"
 
 
 def _read_config() -> dict:
@@ -264,9 +278,31 @@ def _log(entry: Dict[str, Any]) -> None:
         pass  # logging must never gate execution
 
 
+def _load_free_model() -> str:
+    """Resolve the free-tier fallback model: env override > first `:free`
+    entry in config `fallback_providers` > bundled default. Returns "" only if
+    nothing resolves (caller escalates to the human gate)."""
+    if FREE_FALLBACK_MODEL_ENV:
+        return FREE_FALLBACK_MODEL_ENV
+    try:
+        for entry in (_read_config().get("fallback_providers") or []):
+            model = str((entry or {}).get("model") or "")
+            if model.endswith(":free"):
+                return model
+    except Exception:  # pragma: no cover - config must never gate
+        pass
+    return _DEFAULT_FREE_FALLBACK_MODEL
+
+
 def _post_verifier(
     url: str, model: str, timeout: float, api_key: str, display: str, tool_name: str
-) -> Optional[Dict[str, Any]]:
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """POST one verifier tier. Returns (verdict_or_None, error_desc).
+
+    error_desc is "" on success; otherwise a short machine-readable tag
+    ("timeout", "unreachable", "http-<code>", "unparseable") so the caller can
+    decide cold-start-retry vs immediate failover, and log WHY each tier failed.
+    """
     body = {
         "model": model,
         "messages": [
@@ -281,37 +317,109 @@ def _post_verifier(
     try:
         r = requests.post(url, json=body, headers=headers, timeout=timeout)
         r.raise_for_status()
+    except requests.exceptions.Timeout:
+        return None, "timeout"
+    except requests.exceptions.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        logger.warning("laya-tool-risk: verifier HTTP %s (%s)", status, url)
+        return None, f"http-{status}"
+    except requests.exceptions.RequestException as exc:
+        logger.warning("laya-tool-risk: verifier unreachable (%s): %s", url, exc)
+        return None, "unreachable"
+    try:
         content = r.json()["choices"][0]["message"]["content"]
         m = re.search(r"\{.*\}", content, re.DOTALL)
         if not m:
             logger.warning("laya-tool-risk: verifier returned unparseable content: %r", content[:200])
-            return None
-        return json.loads(m.group(0))
-    except Exception as exc:
-        logger.warning("laya-tool-risk: verifier unreachable (%s): %s", url, exc)
-        return None
+            return None, "unparseable"
+        return json.loads(m.group(0)), ""
+    except Exception as exc:  # pragma: no cover - malformed payload must not crash the gate
+        logger.warning("laya-tool-risk: verifier bad payload (%s): %s", url, exc)
+        return None, "unparseable"
 
 
-def _ask_verifier(display: str, tool_name: str) -> Optional[Dict[str, Any]]:
+def _probe_health(base_url: str) -> bool:
+    """True if the router master responds on /health. The verifier URL is the
+    /v1/chat/completions endpoint; /health lives at the server root."""
+    try:
+        root = base_url.rsplit("/v1/chat/completions", 1)[0]
+        return requests.get(f"{root}/health", timeout=HEALTH_TIMEOUT_S).status_code == 200
+    except Exception:  # pragma: no cover
+        return False
+
+
+def _ask_verifier(display: str, tool_name: str) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+    """Ask the verifier chain. Returns (answers, diag).
+
+    Tiers, in order:
+      1. local aux router (primary)
+      2. main-profile default model via OpenRouter (paid)
+      3. free-tier model via OpenRouter (config fallback_providers)
+      else None -> human approval gate (fail-to-REVIEW).
+
+    Cold-start split: if the primary timed out but the router master is UP,
+    retry ONCE with a long window (worker reloading after idle eviction) before
+    failing over. Router DOWN or any other error fails over immediately.
+
+    diag carries the per-attempt trail for the decisions log: attempts=[] of
+    {model, url, error}, plus cold_retry:True when the long retry fired.
+    """
     verifier_url, verifier_model = _resolve_verifier()
-    answers = _post_verifier(
+    diag: Dict[str, Any] = {"attempts": []}
+
+    # Tier 1: local aux router (primary).
+    answers, err = _post_verifier(
         verifier_url, verifier_model, TIMEOUT_S, "llama", display, tool_name
     )
+    diag["attempts"].append({"model": verifier_model, "url": verifier_url, "error": err})
     if answers is not None:
-        return answers
-    # Primary (local aux router) unavailable — fail over to the main profile's
-    # default model before escalating to the human gate.
+        return answers, diag
+
+    # Cold-start split: timeout on a healthy router = worker reloading after
+    # idle eviction (40-90s on this box) — one long retry before failover.
+    if err == "timeout" and _probe_health(verifier_url):
+        logger.warning(
+            "laya-tool-risk: verifier cold-start (timeout on healthy router), "
+            "retrying with %ss window", COLD_START_TIMEOUT_S,
+        )
+        answers, err2 = _post_verifier(
+            verifier_url, verifier_model, COLD_START_TIMEOUT_S, "llama", display, tool_name
+        )
+        diag["cold_retry"] = True
+        diag["attempts"].append({"model": verifier_model, "url": verifier_url, "error": err2})
+        if answers is not None:
+            return answers, diag
+
+    # Tier 2: main profile default model (paid OpenRouter).
     fallback_model = FALLBACK_MODEL_ENV or _load_default_model()
     fallback_url = _resolve_fallback_url()
     if fallback_url and fallback_model:
         logger.warning(
             "laya-tool-risk: primary verifier unavailable, falling back to %s", fallback_model
         )
-        answers = _post_verifier(
+        answers, err2 = _post_verifier(
             fallback_url, fallback_model, FALLBACK_TIMEOUT_S,
             _load_fallback_api_key(), display, tool_name,
         )
-    return answers
+        diag["attempts"].append({"model": fallback_model, "url": fallback_url, "error": err2})
+        if answers is not None:
+            return answers, diag
+
+    # Tier 3: free-tier model (config fallback_providers, e.g. gemma free).
+    free_model = _load_free_model()
+    if fallback_url and free_model:
+        logger.warning(
+            "laya-tool-risk: default failover unavailable, trying free tier %s", free_model
+        )
+        answers, err2 = _post_verifier(
+            fallback_url, free_model, FALLBACK_TIMEOUT_S,
+            _load_fallback_api_key(), display, tool_name,
+        )
+        diag["attempts"].append({"model": free_model, "url": fallback_url, "error": err2})
+        if answers is not None:
+            return answers, diag
+
+    return None, diag
 
 
 def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
@@ -355,13 +463,13 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
             ),
         }
 
-    answers = _ask_verifier(display, tool_name)
+    answers, diag = _ask_verifier(display, tool_name)
     rkey = f"laya-tool-risk:{tool_name}"
     if answers is None:
         # Verifier down: fail-to-REVIEW only for ops that passed both deterministic
         # layers (genuinely ambiguous). Safe reads and catastrophes already resolved.
         _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "escalate",
-              "via": "verifier-down"})
+              "via": "verifier-down", "diag": diag})
         return {
             "action": "approve",
             "message": (

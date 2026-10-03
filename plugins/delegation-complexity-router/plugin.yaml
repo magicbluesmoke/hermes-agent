@@ -1,0 +1,7 @@
+name: delegation-complexity-router
+version: 1.0.0
+description: "Automatic complexity-based model/provider/preset routing for delegate_task calls. Analyzes goal content and returns routing overrides."
+author: Hermes user plugin
+kind: standalone
+provides_hooks:
+  - delegate_task_routing

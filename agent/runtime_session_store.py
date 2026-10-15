@@ -14,6 +14,11 @@ import threading
 
 _worker_process = False
 
+#: Ceiling for one off-loop RPC. ``_call_blocking``'s own socket deadlines already sum to well
+#: under this (5s discovery + 5s identify + 5s open + 20s receipt); the budget exists so a call
+#: that somehow escapes its own bound cannot pin the caller's thread indefinitely.
+_OFF_LOOP_JOIN_SECONDS = 45.0
+
 
 def is_worker_process():
     """A successful self-registration makes this interpreter compute-only.
@@ -43,23 +48,75 @@ class WorkerRPC:
     """Bounded authenticated calls to an existing owner; never starts a daemon.
 
     websockets.sync owns a dedicated frame receiver, independent of the caller.
-    No owner-loop synchronous self-RPC or SQLite fallback is permitted.
+    No owner-loop synchronous self-RPC or SQLite fallback is permitted: a loop running in the
+    calling thread moves the call to a helper thread unless this process *is* the owner.
     """
     def __init__(self, home):
         self.home = Path(home).resolve()
         self.lock = threading.Lock()
         self.endpoint = None
 
+    def _owns_endpoint(self):
+        """True when this process is the owner this RPC would talk to.
+
+        Cheap and offline: an owner publishes its PID in its control home's ``gateway.pid``, and
+        ``live_gateway_pid_for_home`` proves that PID against the live command line. A served
+        secondary owns no ``gateway.pid`` of its own, so the multiplexer's PID is what gets read
+        and it cannot equal ours. Unprovable identity counts as "not ours": a worker's own
+        auxiliary loop must keep persisting, and every socket operation in the call carries its
+        own deadline, so a wrong answer stalls and errors rather than hanging.
+        """
+        from hermes_cli.gateway_runtime import control_home_for
+        from gateway.status import live_gateway_pid_for_home
+        try:
+            home = control_home_for(self.home, self.endpoint)
+            pid = live_gateway_pid_for_home(Path(home))
+        except Exception:
+            return False
+        return pid is not None and pid == os.getpid()
+
+    def _call_off_loop(self, method, params):
+        """Run one bounded RPC on a helper thread instead of on a thread that owns a loop.
+
+        The synchronous websocket client must never be handed a running event loop, so the whole
+        call moves to a short-lived daemon thread. The helper is bounded by ``_call_blocking``'s
+        own socket deadlines; this join ceiling sits above their sum and therefore only fires if a
+        call somehow escapes its own bound.
+        """
+        outcome = {}
+
+        def run():
+            try:
+                outcome['result'] = self._call_blocking(method, params)
+            except BaseException as exc:  # re-raised on the caller's thread
+                outcome['error'] = exc
+
+        helper = threading.Thread(target=run, name='worker-rpc-off-loop', daemon=True)
+        helper.start()
+        helper.join(timeout=_OFF_LOOP_JOIN_SECONDS)
+        if helper.is_alive():
+            raise TimeoutError('worker_receipt_timeout')
+        if 'error' in outcome:
+            raise outcome['error']
+        return outcome['result']
+
     def __call__(self, method, **params):
-        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
-        from hermes_cli.gateway_runtime_discovery import query_identify
-        from websockets.sync.client import connect
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            pass
-        else:
+            return self._call_blocking(method, params)
+        # A loop runs in THIS thread. The guard exists for the owner's own loop, where a synchronous
+        # RPC would deadlock the very socket that has to answer it; a worker's private auxiliary loop
+        # has no such dependency. Prove ownership offline first, then hand the blocking work to a
+        # helper thread — only the owner itself keeps the hard failure.
+        if self._owns_endpoint():
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
+        return self._call_off_loop(method, params)
+
+    def _call_blocking(self, method, params):
+        from hermes_cli.gateway_client import _session_ticket, gateway_ws_target
+        from hermes_cli.gateway_runtime_discovery import query_identify
+        from websockets.sync.client import connect
         with self.lock:
             # A served secondary has no socket; its multiplexer's descriptor names it.
             from hermes_cli.gateway_runtime import discover_gateway_endpoint

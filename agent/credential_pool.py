@@ -2289,10 +2289,10 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
             if entry is None:
                 return None
             _label = entry.label or entry.id[:8]
-            if self._is_model_scoped_failure(status_code, model, failure_reason):
-                # A generic Anthropic 429 (per-model rate limit) or a Codex account model
-                # entitlement rejection: bench this model only, the credential stays
-                # available for its siblings.
+            if self._is_model_scoped_failure(status_code, model, failure_reason, error_context):
+                # A generic Anthropic 429 (per-model rate limit), an OpenRouter free-model
+                # 429, or a Codex account model entitlement rejection: bench this model only,
+                # the credential stays available for its siblings.
                 self._cool_down_model(entry, model, error_context, failure_reason=failure_reason)
                 logger.info("credential pool: %s unavailable for model %s; other models stay available", _label, model)
                 self._current_id = None

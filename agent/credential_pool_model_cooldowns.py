@@ -18,6 +18,15 @@ if TYPE_CHECKING:
 # (credential, model) pair until an explicit ``hermes auth reset`` clears model_cooldowns (#71970).
 MODEL_ENTITLEMENT_BENCH_SECONDS = 365 * 24 * 60 * 60
 
+# Bodies OpenRouter returns when a free-tier bucket is spent. A 429 carrying one of these
+# mentions is a free-model meter, not an account-wide throttle.
+_FREE_MODEL_QUOTA_MARKERS = (
+    "free-models-per-day",
+    "free-models-per-minute",
+    "free model requests per day",
+    "free model requests per minute",
+)
+
 
 def model_cooldown_until(entry: PooledCredential, model: Optional[str]) -> Optional[float]:
     """Active cooldown blocking *entry* for *model*, or ``None``.
@@ -60,19 +69,42 @@ class CredentialPoolModelCooldownMixin:
 
     def _is_model_scoped_failure(
         self, status_code: Optional[int], model: Optional[str], failure_reason: Optional[str],
+        error_context: Optional[dict[str, Any]] = None,
     ) -> bool:
-        """Anthropic per-model 429s, and a Codex ChatGPT-account model entitlement 400: the
-        account cannot use *model*, but the credential stays valid for every other model (#71970)."""
+        """Anthropic per-model 429s, OpenRouter per-model free-tier 429s, and a Codex
+        ChatGPT-account model entitlement 400: the account cannot use *model*, but the
+        credential stays valid for every other model (#71970)."""
         from agent.credential_pool import FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED
 
         if not model:
             return False
         if failure_reason == "model_entitlement":
             return True
-        return (
-            self.provider == "anthropic" and status_code == 429
-            and failure_reason not in (FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED)
-        )
+        if failure_reason in (FAILURE_REASON_BILLING, FAILURE_REASON_BILLING_UNVERIFIED):
+            return False
+        if status_code != 429:
+            return False
+        if self.provider == "anthropic":
+            return True
+        return self._is_openrouter_free_model_429(model, error_context)
+
+    @staticmethod
+    def _is_openrouter_free_model_429(
+        model: str, error_context: Optional[dict[str, Any]],
+    ) -> bool:
+        """OpenRouter meters :free models per model per day/minute.
+
+        A 429 that names the free bucket (or any 429 on a ``:free`` model) says
+        nothing about the same key's paid models, so it must not bench the whole
+        credential — that also disables the paid fallback, which is the very
+        escape hatch a free-tier cap needs (#free-models-per-day).
+        """
+        if (model or "").strip().lower().endswith(":free"):
+            return True
+        message = ""
+        if isinstance(error_context, dict):
+            message = str(error_context.get("message") or error_context.get("reason") or "").lower()
+        return any(marker in message for marker in _FREE_MODEL_QUOTA_MARKERS)
 
     def _cool_down_model(
         self, entry: PooledCredential, model: str, error_context: Optional[dict[str, Any]],

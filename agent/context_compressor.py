@@ -825,9 +825,13 @@ _SUMMARY_TOKENS_CEILING = 10_000
 # After this many failures at one cursor, skip the exchange to avoid busy-looping.
 _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
 
-# Prompt-side char cap on the serialized turn block (~40K tokens; head+tail kept,
-# see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
-_SUMMARY_INPUT_MAX_CHARS = 160_000
+# Prompt-side char cap on the serialized turn block (head+tail kept,
+# see _bound_summary_input). Scaled for the aux compression model's window:
+# 160K chars (~40K tokens) fit the old 64K aux-compress (qwen3.5-4b); the
+# aux-coding-maxfit (qwen3.5-9b) window is 262144, so the cap is 4x (640K chars
+# ~= 160K tokens, leaving headroom for prompt overhead + 10K-token summary).
+# NEVER add a max_tokens wire cap on the summary call.
+_SUMMARY_INPUT_MAX_CHARS = 640_000
 
 _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
 

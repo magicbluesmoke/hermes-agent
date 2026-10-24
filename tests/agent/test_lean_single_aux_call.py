@@ -139,16 +139,16 @@ class TestSampledSummaryInput:
     def test_sampling_is_bounded_ordered_and_marked(self):
         # Distinct decade markers let us verify oldest-to-newest order and
         # uniform coverage across the whole region.
-        records = [f"<seg{i:02d}>" + ("x" * 50_000) for i in range(10)]
+        records = [f"<seg{i:02d}>" + ("x" * 50_000) for i in range(14)]  # 700K chars > 640K cap
         out, _coverage = ContextCompressor._sample_summary_records(records)
         assert len(out) <= ContextCompressor._SUMMARY_INPUT_MAX_CHARS
         assert "chars elided" in out
-        seen = [i for i in range(10) if f"<seg{i:02d}>" in out]
+        seen = [i for i in range(14) if f"<seg{i:02d}>" in out]
         # Coverage reaches past the head AND includes the newest end.
         assert seen == sorted(seen)
-        assert any(i >= 5 for i in seen)
+        assert any(i >= 7 for i in seen)
         # The newest record anchors the last slice, so its token must be present outright.
-        assert "<seg09>" in out
+        assert "<seg13>" in out
 
     def test_legacy_mode_keeps_head_tail_bound(self):
         c = _mk_compressor(tail_mode="legacy")

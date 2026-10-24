@@ -679,9 +679,20 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
     repo_root = Path(scheduler.__file__).resolve().parent.parent
 
+    # Under PM the interpreter is a bare tools/store python; its deps come from the
+    # committed venv, so the worker pin must restore that site-packages too or the
+    # first third-party import fails before the ack. Force a deterministic path here.
+    monkeypatch.setattr(
+        worker_env_mod, "_committed_dependency_site_packages", lambda _root: Path(tmp_path / "runtime-site-packages")
+    )
+
     assert scheduler._launch_external_cron_worker(job) is True
     entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
-    assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
+    assert entries == [
+        str(repo_root),
+        str(tmp_path / "runtime-site-packages"),
+        str(tmp_path / "kept-by-sanitizer"),
+    ]
 
     # Wheel / pipx layout: repo_root == purelib -> untouched.
     monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: repo_root)

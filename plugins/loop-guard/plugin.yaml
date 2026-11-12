@@ -1,0 +1,3 @@
+name: loop-guard
+version: 0.1.0
+description: Failure-loop intervention (TokenEconomizer-style) for Hermes

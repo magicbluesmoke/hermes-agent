@@ -1,0 +1,11 @@
+name: kanban-triage-workspace-resolver
+description: >
+  After the triage specifier promotes a card (triage -> todo), resolve and apply
+  the card's workspace: set it when it is missing (still scratch) and the body or
+  notes name a concrete workspace, or correct it when the notes contradict the
+  pinned workspace. Validates every candidate as an absolute, existing directory.
+version: 0.1.0
+author: agent
+kind: backend
+provides_hooks:
+  - on_kanban_dispatch_tick

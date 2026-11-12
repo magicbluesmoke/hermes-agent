@@ -2682,10 +2682,19 @@ def complete_task(
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
         trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, worker_started_at, block_kind FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = trow["status"] if trow else None
+        # Human-decision gates (needs_input) must not be auto-completed by
+        # workers: only an explicit human override (force=True) may close them.
+        if (
+            not force
+            and expected_run_id is not None
+            and trow is not None
+            and trow["block_kind"] == "needs_input"
+        ):
+            raise LiveClaimError(task_id)
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.

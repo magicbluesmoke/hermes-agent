@@ -234,9 +234,6 @@ def on_pre_verify(
     if not coding or not changed_paths:
         return None
 
-    # Throttle: only nudge on early attempts (default max_verify_nudges = 3)
-    if attempt >= 2:
-        return None
 
     # Filter to source Python files
     source_files = [p for p in changed_paths if _is_source_python(p)]
@@ -311,7 +308,7 @@ def on_pre_verify(
         len(missing_tests), len(untouched_tests), attempt,
     )
 
-    return {"action": "continue", "message": message}
+    return {"action": "block", "message": message}
 
 
 def register(ctx: Any) -> None:

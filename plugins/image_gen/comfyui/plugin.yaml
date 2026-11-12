@@ -1,0 +1,6 @@
+name: comfyui
+version: 1.0.0
+description: "Image generation via local ComfyUI (SDXL) REST API"
+author: Local
+kind: backend
+requires_env: []

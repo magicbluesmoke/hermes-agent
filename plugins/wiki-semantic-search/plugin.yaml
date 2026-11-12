@@ -1,0 +1,8 @@
+name: wiki-semantic-search
+version: 1.0.0
+description: "Semantic search over the wiki via sqlite-vec embeddings. Callable by agents as wiki_semantic_search."
+author: Hermes user plugin
+kind: standalone
+provides_tools:
+  - wiki_semantic_search
+# capabilities: (none needed — new tool, not an override)

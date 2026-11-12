@@ -1,0 +1,12 @@
+name: kanban-worktree-rebase
+version: 1.0.0
+description: >
+  Keep kanban worktree branches landable. Fires on kanban_task_completed; if the
+  card ran in a linked worktree whose branch has fallen behind the base branch,
+  rebase wt/<task-id> onto the base tip so the ff-only lander can carry it
+  forward. Never merges, never blocks completion, never discards a conflicted
+  rebase.
+author: agent
+kind: backend
+hooks:
+  - kanban_task_completed

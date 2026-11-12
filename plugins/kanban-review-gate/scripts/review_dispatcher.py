@@ -54,15 +54,28 @@ def _board_db_path(board: Optional[str]) -> Path:
 
 
 def _load_config() -> dict:
-    cfg_path = HERMES_HOME / "config.yaml"
-    if not cfg_path.exists():
-        return {}
-    try:
-        import yaml
-        with open(cfg_path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
+    """Load config.yaml, preferring the profile copy but falling back to the
+    shared root when the profile has no ``kanban_review_dispatcher`` section.
+
+    Profile-mode cron runs see ~/.hermes/profiles/<name>/config.yaml, while the
+    dispatcher settings (reviewer_models, interval_hours, max_review_iterations)
+    live in ~/.hermes/config.yaml.
+    """
+    candidates = [HERMES_HOME / "config.yaml", _get_hermes_root() / "config.yaml"]
+    loaded = []
+    for cfg_path in candidates:
+        if not cfg_path.exists():
+            continue
+        try:
+            import yaml
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                loaded.append(yaml.safe_load(f) or {})
+        except Exception:
+            continue
+    for cfg in loaded:
+        if cfg.get("kanban_review_dispatcher"):
+            return cfg
+    return loaded[0] if loaded else {}
 
 
 def _review_cards(conn: sqlite3.Connection) -> list[dict]:
@@ -101,6 +114,10 @@ def _load_core_module():
     import importlib.util
     import sys as _sys
     candidate = HERMES_HOME / "hermes-agent" / "hermes_cli" / "kanban_db.py"
+    if not candidate.exists():
+        # Profile-scoped HERMES_HOME has no hermes-agent checkout; core lives in
+        # the shared root (~/.hermes).
+        candidate = _get_hermes_root() / "hermes-agent" / "hermes_cli" / "kanban_db.py"
     spec = importlib.util.spec_from_file_location("hermes_cli.kanban_db", candidate)
     if spec is None or spec.loader is None:
         raise RuntimeError("kanban_db.py not loadable")
@@ -114,8 +131,15 @@ def _load_core_module():
 
 
 def _ensure_run_id(conn: sqlite3.Connection, task_id: str) -> Optional[int]:
+    """Return the task's LIVE run id, or None.
+
+    Core `complete_task` treats `expected_run_id` as proof of ownership of a
+    live claim; handing it an already-closed run id from `task_runs` is wrong.
+    Read `tasks.current_run_id` instead.
+    """
     try:
-        return int(conn.execute("SELECT id FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)).fetchone()[0])
+        row = conn.execute("SELECT current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+        return int(row[0]) if row and row[0] is not None else None
     except Exception:
         return None
 
@@ -126,8 +150,9 @@ def _approve(task_id: str, board: Optional[str], evidence: str) -> bool:
         return False
     try:
         conn = sqlite3.connect(str(db_path))
+        # Core helpers index rows by name.
+        conn.row_factory = sqlite3.Row
         try:
-            conn.execute("BEGIN IMMEDIATE")
             kb = _load_core_module()
             run_id = _ensure_run_id(conn, task_id)
             ok = kb.complete_task(
@@ -136,18 +161,9 @@ def _approve(task_id: str, board: Optional[str], evidence: str) -> bool:
                 summary=evidence,
                 metadata={"plugin": "kanban-review-gate", "dispatcher": "review_dispatcher", "run_id": run_id},
                 expected_run_id=run_id,
-                with_reason=False,
             )
-            if ok:
-                conn.commit()
-                return True
-            conn.rollback()
-            return False
+            return bool(ok)
         except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             raise
         finally:
             conn.close()
@@ -161,26 +177,19 @@ def _request_changes(task_id: str, board: Optional[str], reason: str) -> bool:
         return False
     try:
         conn = sqlite3.connect(str(db_path))
+        # Core helpers index rows by name.
+        conn.row_factory = sqlite3.Row
         try:
-            conn.execute("BEGIN IMMEDIATE")
             kb = _load_core_module()
-            ok = kb.request_changes(
+            # Core returns (ok, implementer|reason), not a bare bool.
+            ok, _detail = kb.request_changes(
                 conn,
                 task_id,
                 reason=reason,
                 expected_run_id=None,
-                with_reason=False,
             )
-            if ok:
-                conn.commit()
-                return True
-            conn.rollback()
-            return False
+            return bool(ok)
         except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             raise
         finally:
             conn.close()
@@ -194,8 +203,9 @@ def _escalate(task_id: str, board: Optional[str], iterations: int, reason: str) 
         return False
     try:
         conn = sqlite3.connect(str(db_path))
+        # Core helpers index rows by name.
+        conn.row_factory = sqlite3.Row
         try:
-            conn.execute("BEGIN IMMEDIATE")
             kb = _load_core_module()
             ok = kb.block_task(
                 conn,
@@ -203,18 +213,9 @@ def _escalate(task_id: str, board: Optional[str], iterations: int, reason: str) 
                 reason=f"review escalation after {iterations} iterations: {reason}",
                 kind="needs_input",
                 expected_run_id=None,
-                with_reason=False,
             )
-            if ok:
-                conn.commit()
-                return True
-            conn.rollback()
-            return False
+            return bool(ok)
         except Exception:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
             raise
         finally:
             conn.close()
@@ -303,16 +304,11 @@ def _delegate_review(task: dict, role: str, model: Optional[str]) -> dict[str, A
         # hermes_tools only exists inside a live agent session. This module is
         # sometimes imported by tests or cron subprocesses; fail loudly with a
         # clear diagnostic instead of silently emitting a fake "fail" verdict.
-        return {
-            "verdict": "fail",
-            "gaps": [
-                "delegate_task unavailable: hermes_tools is only importable "
-                f"inside a live Hermes agent session ({exc}). Run the "
-                "kanban-review-dispatch cron (inline dispatch) instead of this "
-                "script as a subprocess."
-            ],
-            "evidence": "",
-        }
+        raise RuntimeError(
+            "delegate_task unavailable: hermes_tools is only importable inside a "
+            f"live Hermes agent session ({exc}). Run the kanban-review-dispatch "
+            "cron with inline dispatch instead of this script as a subprocess."
+        )
     try:
         result = delegate_task(
             context=_reviewer_context(task, role),
@@ -365,8 +361,12 @@ def dispatch(board: Optional[str], max_iterations: int = 3) -> dict:
                 _escalate(card["id"], board, iterations, "iteration cap reached")
                 results.append({"id": card["id"], "action": "escalated", "iterations": iterations})
                 continue
-            spec = _delegate_review(card, "spec", spec_model)
-            quality = _delegate_review(card, "quality", quality_model)
+            try:
+                spec = _delegate_review(card, "spec", spec_model)
+                quality = _delegate_review(card, "quality", quality_model)
+            except RuntimeError as exc:
+                results.append({"id": card["id"], "action": "skipped", "reason": str(exc)})
+                continue
             verdict = "pass" if spec["verdict"] == "pass" and quality["verdict"] == "pass" else "fail"
             gaps = (spec.get("gaps") or []) + (quality.get("gaps") or [])
             evidence = (spec.get("evidence") or "").strip() + "\n" + (quality.get("evidence") or "").strip()

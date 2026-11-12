@@ -355,6 +355,27 @@ def _read_staged_text(repo: str, rel: str) -> str | None:
     return raw.decode("utf-8", errors="replace")
 
 
+def _fail_card_uncommitted(db_path: Path, task_id: str, reason: str) -> None:
+    """Revert a completed card to blocked when auto-commit is blocked.
+
+    The kanban_task_completed hook fires AFTER completion, so the card is
+    already done. If auto-commit could not commit claimed deliverables,
+    reopen the card as blocked so the work is not silently lost.
+    """
+    try:
+        conn = sqlite3.connect(str(db_path))
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='uncommitted' "
+            "WHERE id=? AND status='done'",
+            (task_id,),
+        )
+        conn.commit()
+        conn.close()
+        logger.warning("Card %s reverted to blocked: %s", task_id, reason)
+    except Exception:
+        logger.debug("Failed to revert card %s to blocked", task_id, exc_info=True)
+
+
 def _auto_commit(
     task_id: str,
     board: str | None,
@@ -471,6 +492,7 @@ def _auto_commit(
                     "re-stage before the auto-commit can proceed.",
                     task_id, ", ".join(blocked),
                 )
+                _fail_card_uncommitted(db_path, task_id, "conflict markers in staged files")
                 return
 
             # Resolve the spec/registry ID so a src/-touching auto-commit

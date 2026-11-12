@@ -14,8 +14,10 @@ Why completion-time guard instead of create-time rewrite:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import subprocess
 from pathlib import Path
 from typing import Any, Optional
 
@@ -51,6 +53,70 @@ def _board_db_path(board: Optional[str]) -> Optional[Path]:
     if board and board.strip() and board.strip().lower() != "default":
         return KANBAN_HOME / "boards" / board.strip() / "kanban.db"
     return HERMES_HOME / "kanban.db"
+
+
+def _latest_run_commit(task_id: str, board: Optional[str]) -> Optional[str]:
+    """Return the commit SHA from the task's most recent run metadata, if any."""
+    try:
+        from hermes_cli.kanban_db_connect import connect
+        conn = connect(board=board or None)
+        try:
+            cur = conn.execute(
+                "SELECT metadata FROM task_runs WHERE task_id = ? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (task_id,),
+            )
+            row = cur.fetchone()
+        finally:
+            conn.close()
+        if not row or not row[0]:
+            return None
+        meta = json.loads(row[0])
+        for key in ("commit", "head_sha", "sha", "commit_sha"):
+            val = meta.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+        for key in ("git", "run"):
+            nested = meta.get(key)
+            if isinstance(nested, dict):
+                for subkey in ("commit", "head_sha", "sha"):
+                    val = nested.get(subkey)
+                    if isinstance(val, str) and val.strip():
+                        return val.strip()
+    except Exception:
+        return None
+    return None
+
+
+def _is_ancestor(commit: str, repo: str) -> bool:
+    """True when ``commit`` is an ancestor of HEAD in ``repo``."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", repo, "merge-base", "--is-ancestor", commit, "HEAD"],
+            capture_output=True, text=True, timeout=10,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _correct_workspace_to_dir(task_id: str, board: Optional[str], canonical: str) -> bool:
+    """Rewrite a mislabelled scratch workspace to dir:<canonical> in place."""
+    try:
+        from hermes_cli.kanban_db_connect import connect
+        conn = connect(board=board or None)
+        try:
+            cur = conn.execute(
+                "UPDATE tasks SET workspace_kind = 'dir', workspace_path = ? "
+                "WHERE id = ? AND workspace_kind = 'scratch'",
+                (canonical, task_id),
+            )
+            conn.commit()
+            return cur.rowcount == 1
+        finally:
+            conn.close()
+    except Exception:
+        return False
 
 
 def _is_repo_task(title: Optional[str], body: Optional[str]) -> bool:
@@ -202,6 +268,28 @@ def on_kanban_task_completed(
 
     if is_repo and effective_workspace == "scratch":
         canonical = _CANONICAL_REPO.replace("\\", "/")
+
+        # Before vetoing, check whether the work is already landed in the
+        # canonical repository. A card whose completion commit is an ancestor
+        # of HEAD did its work in the canonical tree and only carries a stale
+        # scratch label; correcting the label is more honest than blocking.
+        commit = _latest_run_commit(task_id, board_slug)
+        if commit and _is_ancestor(commit, canonical):
+            if _correct_workspace_to_dir(task_id, board_slug, canonical):
+                _comment_task(
+                    task_id,
+                    board_slug,
+                    "kanban-scratch-dir-guard: workspace auto-corrected to "
+                    f"dir:{canonical} because completion commit {commit} is "
+                    "already an ancestor of HEAD. The original scratch label "
+                    "was a metadata misconfiguration; no rework was needed.",
+                )
+                logger.info(
+                    "Auto-corrected workspace for landed task %s on board %s",
+                    task_id, board_slug,
+                )
+                return
+
         reason = f"scratch-dir-guard: canonical-repo task must use dir:{canonical}"
         _block_task(task_id, board_slug, reason)
         _comment_task(

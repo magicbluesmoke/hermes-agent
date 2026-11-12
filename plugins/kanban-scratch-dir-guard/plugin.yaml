@@ -2,7 +2,9 @@ name: kanban-scratch-dir-guard
 description: >
   Block completion of canonical-repo kanban tasks that were created with a
   scratch workspace, enforcing dir:$REALM_FORGE_REPO (default ~/src/realm-forge-game).
-version: 0.1.0
+  Auto-corrects a stale scratch label when the completion commit is already an
+  ancestor of HEAD.
+version: 0.2.0
 author: agent
 kind: backend
 hooks:

@@ -1,0 +1,11 @@
+name: kanban-triage-meta
+version: 0.1.0
+description: >
+  Meta-tool (AWO pattern) that collapses the recurring kanban triage chain
+  (board status -> blocked cards -> verify -> close/escalate) into a single
+  deterministic invocation.
+author: agent
+kind: backend
+hooks: []
+tools:
+  - kanban_triage

@@ -244,6 +244,21 @@ def test_pre_fix_window_would_have_false_blocked(buried_repo):
     assert _guard_missing(repo, BODY, window) == [TASK_FILE]
 
 
+def test_detect_repo_root_accepts_a_linked_worktree(tmp_path):
+    """A linked worktree's `.git` is a FILE, not a dir — still the repo root.
+
+    Missing this made the gate fall back to the canonical checkout and verify
+    the wrong tree (observed on realm-forge worktree cards, 2026-10-18).
+    """
+    repo = _init_repo(tmp_path, "main-repo")
+    _commit(repo, "src/base.py", "x = 1\n", "base", int(time.time()) - 60)
+    wt = tmp_path / "linked-worktree"
+    _git(repo, "worktree", "add", "-q", "-b", "wt/test", str(wt))
+
+    assert (wt / ".git").is_file(), "fixture is not a linked worktree"
+    assert mod._detect_repo_root(str(wt)) == str(wt)
+
+
 def test_guard_still_blocks_a_claimed_file_nothing_touched(buried_repo):
     """Widening the window must not remove the guard's teeth."""
     repo, _task_at = buried_repo
@@ -255,3 +270,59 @@ def test_guard_still_blocks_a_claimed_file_nothing_touched(buried_repo):
 
     assert UNTOUCHED_FILE not in changed, sorted(changed)
     assert _guard_missing(repo, body, changed) == [UNTOUCHED_FILE]
+
+
+# --------------------------------------------------------------------------- #
+# Repo-wide invariant tests never gate a single card (t_ad35cbe3 deadlock)
+#
+# The green-open registry test asserts REPOSITORY state, so it cannot pass while
+# any unrelated issue is open. Running it inside a per-card gate deadlocked every
+# card whose acceptance line cited it: t_ad35cbe3 could not close because the
+# thing it tracked was still red. gate-full owns it (tier.full runs both
+# `pytest tests/` and `scripts/check_green_open.py`).
+# --------------------------------------------------------------------------- #
+
+REPO_WIDE = "tests/regressions/test_check_green_open_synthetic.py"
+CARD_SCOPED = "tests/regressions/test_i666_attacker_guard.py"
+
+
+def test_repo_wide_test_is_excluded_from_card_targets():
+    assert mod._is_repo_wide_test(REPO_WIDE)
+    kept, skipped = mod._split_repo_wide([REPO_WIDE, CARD_SCOPED])
+    assert kept == [CARD_SCOPED], "the card's own guard test must still run"
+    assert skipped == [REPO_WIDE]
+
+
+def test_card_scoped_target_is_not_excluded():
+    assert not mod._is_repo_wide_test(CARD_SCOPED)
+    kept, skipped = mod._split_repo_wide([CARD_SCOPED])
+    assert kept == [CARD_SCOPED] and skipped == []
+
+
+def test_exclusion_list_is_env_overridable(monkeypatch):
+    monkeypatch.setenv("KANBAN_VERIFY_GATE_EXCLUDE", CARD_SCOPED.rsplit("/", 1)[-1])
+    assert mod._is_repo_wide_test(CARD_SCOPED), "env override not honoured"
+    assert not mod._is_repo_wide_test(REPO_WIDE), "default list should be replaced"
+    monkeypatch.delenv("KANBAN_VERIFY_GATE_EXCLUDE")
+    assert mod._is_repo_wide_test(REPO_WIDE), "default list should be restored"
+
+
+def test_skip_note_names_the_test_and_who_enforces_it():
+    note = mod._repo_wide_skip_note([REPO_WIDE])
+    assert "test_check_green_open_synthetic.py" in note
+    assert "gate-full" in note
+    assert "check_green_open" in note
+
+
+def test_verify_line_citing_only_the_synthetic_test_leaves_no_target():
+    """The deadlock case: acceptance cites only the repo-wide test."""
+    body = (
+        "ACCEPTANCE\n"
+        f"- `uv run python -m pytest {REPO_WIDE} -q` passes.\n"
+    )
+    target = mod._detect_test_target(body)
+    assert target, "body parser no longer extracts the Verify target"
+    assert mod._is_repo_wide_test(target)
+    kept, skipped = mod._split_repo_wide([target])
+    assert kept == [], "gate would still run the repo-wide test and deadlock"
+    assert skipped == [target]

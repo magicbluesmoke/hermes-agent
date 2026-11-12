@@ -32,6 +32,10 @@ if not os.path.isfile(_candidate_python):
     _candidate_python = os.path.join(_CANONICAL_REPO, ".venv", "bin", "python")
 _CANONICAL_PYTHON = os.environ.get("REALM_FORGE_VENV_PYTHON", _candidate_python)
 
+# Tests asserting repository-wide invariants (registry state, whole-suite health).
+# They belong to gate-full, never to a per-card gate — see _repo_wide_markers().
+_DEFAULT_REPO_WIDE_TESTS = ("test_check_green_open_synthetic.py",)
+
 
 def _hermes_home() -> Path:
     from hermes_constants import get_hermes_home as _ghh
@@ -71,7 +75,10 @@ def _detect_repo_root(workspace_path: Optional[str]) -> Optional[str]:
     if workspace_path:
         p = os.path.abspath(os.path.expanduser(workspace_path))
         while True:
-            if os.path.isdir(os.path.join(p, ".git")):
+            # A linked git worktree stores `.git` as a FILE (gitdir pointer),
+            # so isdir() misses it and the gate falls back to the canonical
+            # checkout — verifying the wrong tree. exists() covers both.
+            if os.path.exists(os.path.join(p, ".git")):
                 return p
             parent = os.path.dirname(p)
             if parent == p:
@@ -111,6 +118,55 @@ def _target_resolves(target: str, repo_root: str) -> bool:
         except Exception:
             continue
     return False
+
+
+def _repo_wide_markers() -> tuple[str, ...]:
+    """Names of tests that assert repository-wide invariants, not one card's work.
+
+    A registry/whole-suite test cannot pass while any unrelated issue is open, so
+    running it inside a per-card gate deadlocks the card: t_ad35cbe3 (2026-10-18)
+    could never close because its own acceptance criterion was "the registry is
+    clean". gate-full enforces these already (tier.full runs ``pytest tests/`` and
+    ``scripts/check_green_open.py``), so the per-card gate defers to it and says so
+    on the card instead of blocking.
+
+    Override with ``KANBAN_VERIFY_GATE_EXCLUDE`` (``:``-,_- or newline-separated
+    names/substrings) so a future repo-wide invariant needs no code change.
+    """
+    raw = os.environ.get("KANBAN_VERIFY_GATE_EXCLUDE", "").strip()
+    if raw:
+        return tuple(
+            p.strip() for p in re.split(r"[:,\n]", raw) if p.strip()
+        )
+    return _DEFAULT_REPO_WIDE_TESTS
+
+
+def _is_repo_wide_test(target: str) -> bool:
+    t = (target or "").strip().strip("`'\"")
+    return any(marker in t for marker in _repo_wide_markers())
+
+
+def _split_repo_wide(targets: list[str]) -> tuple[list[str], list[str]]:
+    """Split targets into (card-scoped, repo-wide-excluded)."""
+    kept: list[str] = []
+    skipped: list[str] = []
+    for t in targets:
+        (skipped if _is_repo_wide_test(t) else kept).append(t)
+    return kept, skipped
+
+
+def _repo_wide_skip_note(names: list[str]) -> str:
+    """Card comment explaining a repo-wide-invariant exclusion (never silent)."""
+    listed = ", ".join(f"`{n}`" for n in dict.fromkeys(names))
+    return (
+        "verify-gate: repo-wide invariant test(s) excluded from the per-card gate: "
+        + listed
+        + ". They assert repository state (open-issue registry / whole-suite "
+        "health), not this card's change, so they cannot pass while any unrelated "
+        "issue is open. gate-full enforces them (tier.full runs both `pytest "
+        "tests/` and `scripts/check_green_open.py`); this card was gated on its "
+        "own scoped tests instead."
+    )
 
 
 def _detect_test_target(task_body: str) -> str:
@@ -581,6 +637,53 @@ def _expand_glob_args(args: list[str], repo_root: str) -> list[str]:
     return out
 
 
+def _failed_nodes(output: str) -> list[str]:
+    """Extract FAILED/ERROR node ids from a pytest short-summary output."""
+    out: list[str] = []
+    for line in (output or "").splitlines():
+        s = line.strip()
+        if not (s.startswith("FAILED ") or s.startswith("ERROR ")):
+            continue
+        parts = s.split(None, 1)
+        if len(parts) < 2:
+            continue
+        nid = parts[1].split(" - ", 1)[0].strip()
+        if "::" in nid and nid not in out:
+            out.append(nid)
+    return out
+
+
+def _load_known_failures(repo_root: str) -> set[str]:
+    """Node ids in the maintained baseline allowlist.
+
+    Prefers the Hermes-owned copy at ``$HERMES_HOME/kanban/known_failures.json``
+    so one refresh applies to every worktree; falls back to the repo copy at
+    ``scripts/known_failures.json``. Missing/malformed -> empty set, which keeps
+    the pre-existing block-on-any-failure behaviour as a safe fallback.
+    """
+    import json as _json
+    from pathlib import Path as _Path
+
+    hermes_home = os.environ.get("HERMES_HOME") or str(_Path.home() / ".hermes")
+    cands = [
+        _Path(hermes_home) / "kanban" / "known_failures.json",
+        _Path(repo_root) / "scripts" / "known_failures.json",
+    ]
+    for path in cands:
+        try:
+            data = _json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        out: set[str] = set()
+        for key in ("failing", "errors"):
+            for nid in data.get(key) or []:
+                if isinstance(nid, str) and "::" in nid:
+                    out.add(nid.strip())
+        if out:
+            return out
+    return set()
+
+
 def _run_pytest(target: str, repo_root: str) -> dict:
     # target may be a space-joined list (e.g. two regression files joined by
     # `" ".join(...)` in the gate caller). Passing the joined string as ONE
@@ -597,6 +700,7 @@ def _run_pytest(target: str, repo_root: str) -> dict:
         *target_args,
         "-q",
         "--tb=line",
+        "--timeout=120",
     ]
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
@@ -626,6 +730,7 @@ def _run_pytest(target: str, repo_root: str) -> dict:
             "passed": passed,
             "failed": failed,
             "errors": errors,
+            "failed_nodes": _failed_nodes(out),
             "output": out[-8000:],
         }
     except Exception as exc:
@@ -634,6 +739,7 @@ def _run_pytest(target: str, repo_root: str) -> dict:
             "passed": 0,
             "failed": 0,
             "errors": 0,
+            "failed_nodes": [],
             "output": f"verify-gate error: {exc}",
         }
 
@@ -1005,6 +1111,11 @@ def on_kanban_task_completed(
         rf_output = ""
 
     target = _detect_test_target(body)
+    repo_wide_skipped: list[str] = []
+    if target and _is_repo_wide_test(target):
+        # Repo-wide invariant test cited on a Verify line: gate-full owns it.
+        repo_wide_skipped.append(target)
+        target = ""
     if target and not _target_resolves(target, repo_root):
         # Verify: line is prose, a template placeholder (<n>), a bare shell
         # command, or a nonexistent path — running pytest on it yields rc=4
@@ -1019,80 +1130,102 @@ def on_kanban_task_completed(
         # issue-id regression test (test_i<issue>_*.py), then TDAD impact.
         # Never default to the whole suite: the board carries many unrelated
         # pre-existing failures that would re-block a green card indefinitely.
+        def _scoped_from(cands: list[str]) -> list[str]:
+            """Resolve tokens, then drop repo-wide invariants (gate-full owns them)."""
+            resolved = [t for t in cands if _target_resolves(t, repo_root)]
+            kept, skipped = _split_repo_wide(resolved)
+            repo_wide_skipped.extend(skipped)
+            return kept
+
         scoped = _summary_test_targets(summary)
         if scoped:
-            scoped = [t for t in scoped if _target_resolves(t, repo_root)]
+            scoped = _scoped_from(scoped)
         if not scoped:
-            scoped = _changed_test_files(repo_root)
-        if scoped:
-            scoped = [t for t in scoped if _target_resolves(t, repo_root)]
+            scoped = _scoped_from(_changed_test_files(repo_root))
         if not scoped:
-            scoped = _discover_regression_tests(body, repo_root)
-        if scoped:
-            scoped = [t for t in scoped if _target_resolves(t, repo_root)]
+            scoped = _scoped_from(_discover_regression_tests(body, repo_root))
         if not scoped:
-            scoped = _impact_affected_tests(body, repo_root)
-        if scoped:
-            scoped = [t for t in scoped if _target_resolves(t, repo_root)]
+            scoped = _scoped_from(_impact_affected_tests(body, repo_root))
         if scoped:
             target = " ".join(dict.fromkeys(scoped))
         else:
-            # Fail closed: if the card names source files (FILE:/CHANGE: body)
-            # but we still can't derive a scoped test target, block for
-            # operator attention instead of silently passing.
-            if claimed:
-                if override:
+            # Scope to changed files only to avoid pre-existing failures.
+            # Use _git_changed_files to get the actual changed .py files,
+            # then derive test targets from those files.
+            changed_files = _git_changed_files(repo_root, task_id, _task_claim_epoch(task_id, board))
+            if changed_files:
+                # Derive test targets from changed source files using TDAD impact
+                impact_tests = _impact_affected_tests(body, repo_root)
+                if impact_tests:
+                    scoped = _scoped_from(impact_tests)
+                if not scoped:
+                    # Fall back to changed test files
+                    scoped = _scoped_from(_changed_test_files(repo_root))
+            else:
+                # No changed files detected -> comment-and-pass
+                if repo_wide_skipped:
                     _comment_task(
-                        task_id, board,
-                        "verify-gate: operator override honored — no scoped "
-                        "test target; closing per operator verification.",
+                        task_id, board, _repo_wide_skip_note(repo_wide_skipped),
                     )
                     return
-                reason = (
-                    "verify_gate: no scoped test target derivable for a "
-                    "FILE:/CHANGE: card (no pytest/verify line, no "
-                    "test_i<issue>_*.py, no summary pytest line). Blocking for "
-                    "operator verification instead of closing on self-report."
-                )
-                _comment_task(task_id, board, reason)
-                _block_task(task_id, board, reason)
-                return
-            # Implementation-issue cards (create_known_issue_tasks.py body:
-            # 'Fix expected: implement and verify.') must also fail closed.
-            # A worker can close on RED-only self-report before its regression
-            # test is discoverable, letting a red test slip through as done
-            # (observed I69 2026-09-03: closed done with
-            # test_i69_category_fallback_buyback_loop.py still failing).
-            # Research/decision/test-only cards without 'Fix expected' keep
-            # the old comment-and-pass path.
-            if re.search(r"Fix expected", body, re.IGNORECASE):
-                if override:
-                    _comment_task(
-                        task_id, board,
-                        "verify-gate: operator override honored — "
-                        "implementation card closed per operator verification.",
+                # Fail closed: if the card names source files (FILE:/CHANGE: body)
+                # but we still can't derive a scoped test target, block for
+                # operator attention instead of silently passing.
+                if claimed:
+                    if override:
+                        _comment_task(
+                            task_id, board,
+                            "verify-gate: operator override honored — no scoped "
+                            "test target; closing per operator verification.",
+                        )
+                        return
+                    reason = (
+                        "verify_gate: no scoped test target derivable for a "
+                        "FILE:/CHANGE: card (no pytest/verify line, no "
+                        "test_i<issue>_*.py, no summary pytest line). Blocking for "
+                        "operator verification instead of closing on self-report."
                     )
+                    _comment_task(task_id, board, reason)
+                    _block_task(task_id, board, reason)
                     return
-                reason = (
-                    "verify_gate: implementation card with no scoped test "
-                    "target derivable at gate time (no pytest/verify line, no "
-                    "test_i<issue>_*.py found in tree, no summary pytest "
-                    "line). The worker may have closed on RED-only self-report "
-                    "before committing its regression test. Blocking for "
-                    "operator verification instead of closing on self-report."
+                # Implementation-issue cards (create_known_issue_tasks.py body:
+                # 'Fix expected: implement and verify.') must also fail closed.
+                # A worker can close on RED-only self-report before its regression
+                # test is discoverable, letting a red test slip through as done
+                # (observed I69 2026-09-03: closed done with
+                # test_i69_category_fallback_buyback_loop.py still failing).
+                # Research/decision/test-only cards without 'Fix expected' keep
+                # the old comment-and-pass path.
+                if re.search(r"Fix expected", body, re.IGNORECASE):
+                    if override:
+                        _comment_task(
+                            task_id, board,
+                            "verify-gate: operator override honored — "
+                            "implementation card closed per operator verification.",
+                        )
+                        return
+                    reason = (
+                        "verify_gate: implementation card with no scoped test "
+                        "target derivable at gate time (no pytest/verify line, no "
+                        "test_i<issue>_*.py found in tree, no summary pytest "
+                        "line). The worker may have closed on RED-only self-report "
+                        "before committing its regression test. Blocking for "
+                        "operator verification instead of closing on self-report."
+                    )
+                    _comment_task(task_id, board, reason)
+                    _block_task(task_id, board, reason)
+                    return
+                _comment_task(
+                    task_id, board,
+                    "verify-gate: no scoped test target derivable (no pytest/verify "
+                    "line, no test_i<issue>_*.py regression test, no File: lines for "
+                    "TDAD impact, no summary pytest line, no changed files). "
+                    "Skipping full-suite gate to avoid re-blocking on unrelated "
+                    "pre-existing failures; operator verifies the scoped change directly.",
                 )
-                _comment_task(task_id, board, reason)
-                _block_task(task_id, board, reason)
                 return
-            _comment_task(
-                task_id, board,
-                "verify-gate: no scoped test target derivable (no pytest/verify "
-                "line, no test_i<issue>_*.py regression test, no File: lines for "
-                "TDAD impact, no summary pytest line). Skipping full-suite gate "
-                "to avoid re-blocking on unrelated pre-existing failures; "
-                "operator verifies the scoped change directly.",
-            )
-            return
+    if repo_wide_skipped:
+        _comment_task(task_id, board, _repo_wide_skip_note(repo_wide_skipped))
     result = _run_pytest(target, repo_root)
 
     # TDAD impact pass: also run tests affected by the changed files so a
@@ -1102,6 +1235,9 @@ def on_kanban_task_completed(
     impact_result = None
     if result["failed"] == 0 and result["returncode"] == 0:
         impact_tests = _impact_affected_tests(task_body or "", repo_root)
+        impact_tests, _impact_repo_wide = _split_repo_wide(impact_tests)
+        if _impact_repo_wide:
+            repo_wide_skipped.extend(_impact_repo_wide)
         if impact_tests:
             impact_target = " ".join(impact_tests)
             impact_result = _run_pytest(impact_target, repo_root)
@@ -1139,24 +1275,77 @@ def on_kanban_task_completed(
     # breakage. Record the errors as evidence and do not block.
     card_failed = result["failed"] > 0
     impact_failed = impact_result is not None and impact_result["failed"] > 0
-    if card_failed or impact_failed:
+
+    # Delta check against the maintained baseline allowlist
+    # (scripts/suite_baseline.py capture -> known_failures.json). The board
+    # carries dozens of pre-existing failures; blocking on those re-blocks a
+    # finished card indefinitely (observed 2026-10-18: five cards complete and
+    # committed, held open only by baseline reds). Block ONLY on failures not
+    # in the allowlist. Missing allowlist -> empty set -> old behaviour.
+    known = _load_known_failures(repo_root)
+    failed_now: list[str] = list(result.get("failed_nodes") or [])
+    if impact_result is not None:
+        failed_now += list(impact_result.get("failed_nodes") or [])
+    failed_now = list(dict.fromkeys(failed_now))
+    new_failures = [n for n in failed_now if n not in known]
+    known_hits = [n for n in failed_now if n in known]
+
+    # Fail closed: pytest reported failures but the short-summary parse yielded
+    # no node ids (unusual reporter/config, or a crash before the summary).
+    # Without ids there is no delta to compute, so we cannot prove the failures
+    # are pre-existing — treat as a regression rather than pass silently.
+    if (card_failed or impact_failed) and not failed_now:
+        new_failures = ["<unparsed failure output — see evidence comment>"]
+
+    known_note = (
+        "\n\nverify-gate: known-baseline failures observed (allowlisted, NOT "
+        "blocking):\n"
+        + "\n".join(f"  - {n}" for n in known_hits)
+        if known_hits else ""
+    )
+
+    if (card_failed or impact_failed) and new_failures:
+        # At least one failing node id is NOT in the allowlist -> real regression.
         if override:
             _comment_task(
                 task_id, board,
                 evidence
                 + "\n\nverify-gate: operator override honored — pytest "
                 "failure verified by operator as out-of-scope/pre-existing; "
-                "card closed.",
+                "card closed."
+                + known_note,
             )
             return
         _block_task(
             task_id,
             board,
             f"verify_gate: pytest failed target={target} failed={result['failed']}"
-            + (f" impact_failed={impact_result['failed']}" if impact_result else ""),
+            + (f" impact_failed={impact_result['failed']}" if impact_result else "")
+            + f" new_failures={len(new_failures)}",
         )
         _comment_task(
-            task_id, board, evidence + "\n\nCard re-blocked by verify-gate."
+            task_id, board,
+            evidence
+            + "\n\nNew (non-allowlisted) failures — these are regressions:\n"
+            + "\n".join(f"  + {n}" for n in new_failures)
+            + known_note
+            + "\n\nCard re-blocked by verify-gate.",
+        )
+        return
+
+    if card_failed or impact_failed:
+        # Failures exist but every one is in the maintained allowlist: baseline
+        # reds the board already knows about. Comment the evidence and let the
+        # card close — this is the delta-gate contract in
+        # docs/verify-gate-policy.md Q1.
+        _comment_task(
+            task_id, board,
+            evidence
+            + "\n\nAll observed failures are in the known-failures allowlist "
+            "(scripts/known_failures.json) — pre-existing baseline reds, not "
+            "caused by this card. Not re-blocking."
+            + known_note
+            + "\n\nClosure verified (delta vs baseline).",
         )
         return
     if result["returncode"] != 0 or (impact_result and impact_result["returncode"] != 0):

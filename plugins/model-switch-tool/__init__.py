@@ -4,9 +4,14 @@ Registers into the 'delegation' toolset (always enabled, conceptually fitting
 alongside delegate_task for routing decisions).
 """
 
-from __future__ import annotations
+import os
+import sys
 
-from .tool import SCHEMA, check_fn, handle_model_switch
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+if _PLUGIN_DIR not in sys.path:
+    sys.path.insert(0, _PLUGIN_DIR)
+
+from tool import SCHEMA, check_fn, handle_model_switch
 
 
 def register(ctx) -> None:

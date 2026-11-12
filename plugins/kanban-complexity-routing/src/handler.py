@@ -2,7 +2,6 @@
 
 Unified config source:
 - kanban: hooks ``kanban_task_claimed``, writes ``task.model_override``
-- delegation: returns override dict from ``delegate_task_routing``
 
 Self-contained since 2026-08-03: routing logic lives in ``src/routing.py``
 inside this plugin (survives ``hermes update`` which wipes in-tree local
@@ -341,23 +340,3 @@ def handle_kanban_task_claimed(**kwargs: Any) -> None:
                 conn.close()
             except Exception:
                 pass
-
-
-def handle_delegate_task_routing(**kwargs: Any) -> Dict[str, Any]:
-    goal = kwargs.get("goal") or ""
-    try:
-        block = _routing_block()
-        if not isinstance(block, dict) or not block.get("enabled"):
-            return {}
-        target = _resolve_routing(block, goal)
-        if not target:
-            return {}
-        return {
-            "model": target.get("model"),
-            "provider": target.get("provider"),
-            "preset": target.get("preset"),
-            "scope": target.get("scope"),
-        }
-    except Exception as exc:
-        logger.debug("kanban-complexity-routing delegate_task_routing failed: %s", exc)
-        return {}

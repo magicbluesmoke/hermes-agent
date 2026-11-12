@@ -305,6 +305,8 @@ def select_target(goal: str, config: Optional[Dict[str, Any]] = None) -> Optiona
     if not route:
         return None
     if _session_escalations >= max_esc:
+        # Reset counter when cap is reached to prevent permanent fallback
+        _session_escalations = 0
         return _fallback_target(block)
     _session_escalations += 1
     target = route.get("target") or {}

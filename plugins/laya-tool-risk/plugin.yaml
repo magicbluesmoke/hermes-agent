@@ -1,5 +1,8 @@
 name: laya-tool-risk
-version: 2.1.0
-description: "Tool-risk verifier — aux-router LLM (Qwen3.5-9B) gate on side-effect tool calls. Deterministic safe/catastrophic layers plus model verdicts: low/medium auto-allow, high auto-block; only ambiguity escalates to human. 3-tier failover: local aux -> default model -> free tier. Targets >=95% auto decisions."
+version: 2.4.1
+description: "Tool-risk verifier — aux-router LLM (resolved from auxiliary.approval, currently ornith = Ornith-1.5-9B) gate on side-effect tool calls. Deterministic safe/catastrophic layers plus model verdicts: low/medium auto-allow, high auto-block. Backstop-aware terminal state (O2): verifier-down/ambiguous FAILS OPEN (allow + chat-visible warning) for tools a native floor also covers (terminal, execute_code) and FAILS TO REVIEW (escalates to the human gate via the approve directive) for every other side-effect tool. 3-tier failover: local aux -> default model -> free tier, one wall-clock budget."
 author: michael-anselmi
 kind: standalone
+provides_hooks:
+  - pre_tool_call
+  - transform_tool_result

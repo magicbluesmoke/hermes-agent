@@ -1,23 +1,41 @@
-"""laya-tool-risk plugin v2.1: pre_tool_call risk gate backed by the aux router LLM.
+"""laya-tool-risk plugin v2.4.1: pre_tool_call risk gate backed by the aux router LLM.
 
 Every side-effect tool call (terminal, write_file, patch, execute_code, browser, ...)
-is classified by the aux router (:8082, model aux-coding-maxfit = Qwen3.5-9B) through a
+is classified by the aux router (:8082; model resolved from auxiliary.approval, currently
+single ornith preset = Ornith-1.5-9B) through a
 strict JSON rubric. Read-only tools and safe inspection commands pass deterministically
 (zero latency, zero false positives). Catastrophic patterns are blocked deterministically
 BEFORE any model call. Model verdicts: low/medium -> auto-ALLOW, high -> auto-BLOCK.
-Only verifier outage or a malformed model response escalates to the human approval gate
-(fail-to-REVIEW, rare).
+Verifier outage or a malformed model response -> backstop-aware terminal state (O2): tools a
+native Hermes floor/gate also covers (terminal, execute_code) FAIL OPEN with a logged warning;
+every other side-effect tool (write_file, patch, browser*, skill_manage, cronjob_manage,
+process_manage) FAILS TO REVIEW -- the approve directive is routed through the human-approval
+gate, which is itself fail-closed. Deterministic blocks above still apply in both cases.
 
-Failover chain (v2.1): local aux router -> main-profile default model (paid OpenRouter)
+Failover chain (v2.2): local aux router -> main-profile default model (paid OpenRouter)
 -> free-tier model (config fallback_providers, e.g. gemma free) -> human gate. A router
 health probe splits OUTAGE (fail over immediately) from COLD START after idle eviction
-(one 120s retry before failover). Every attempt and error reason is recorded in the
-decisions.jsonl entry so outages are diagnosable from the log alone.
+(one bounded retry before failover). The WHOLE chain runs under a single wall-clock budget
+(TOTAL_BUDGET_S, default 20s, env LAYA_TOOL_RISK_BUDGET): every per-tier timeout is clamped
+to the time left, so the callback can never exceed the pre_tool_call hook bound
+(plugins.hook_callback_timeout, default 30s) and wedge the agent — on exhaustion it reaches the
+backstop-aware terminal state (fail OPEN for backstopped tools, fail TO REVIEW for the rest).
+Every attempt and error reason is recorded in the decisions.jsonl entry so outages are
+diagnosable from the log alone.
 
 Return shapes (matched against _get_pre_tool_call_directive_details on this install):
   None                                  -> allow
   {"action": "block", "message": ...}   -> veto, message becomes tool result
   {"action": "approve", "message": ...} -> escalate to human gate
+
+Fail-open warnings reach the user on two channels:
+  * IN CHAT (interactive CLI): _emit_cli_warning() prints a line through the CLI's own
+    renderer (``cli._cprint``). The CLI does NOT display tool-result bodies -- its per-tool
+    completion line is built from the call ARGS and ignores the result -- so a hook-return
+    channel cannot surface a visible notice. Guarded: a no-op in gateway/TUI/headless.
+  * IN MODEL CONTEXT: transform_tool_result prepends the warning to that call's result
+    string (recorded by tool_call_id in on_pre_tool_call), so the model also knows the op
+    ran unverified. This text is NOT shown to the user by the CLI.
 """
 from __future__ import annotations
 
@@ -25,6 +43,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -37,7 +56,7 @@ logger = logging.getLogger(__name__)
 # ~/.hermes/config.yaml fail to resolve. Precedence everywhere:
 #   env override > config.yaml > these constants.
 _DEFAULT_VERIFIER_URL = "http://127.0.0.1:8082/v1/chat/completions"
-_DEFAULT_VERIFIER_MODEL = "aux-coding"
+_DEFAULT_VERIFIER_MODEL = ""
 _DEFAULT_FALLBACK_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 VERIFIER_URL_ENV = os.environ.get("LAYA_VERIFIER_URL", "")
@@ -64,6 +83,27 @@ HEALTH_TIMEOUT_S = float(os.environ.get("LAYA_HEALTH_TIMEOUT", "2.0"))
 # Free-tier (third) model: env override > config fallback_providers > bundled.
 FREE_FALLBACK_MODEL_ENV = os.environ.get("LAYA_FREE_FALLBACK_MODEL", "")
 _DEFAULT_FREE_FALLBACK_MODEL = "google/gemma-4-26b-a4b-it:free"
+
+# Single total wall-clock budget for the WHOLE verifier chain (primary + cold
+# retry + both failover tiers). The pre_tool_call hook is FAIL-CLOSED and bounded
+# by plugins.hook_callback_timeout (default 30s): without this cap a cold primary
+# (COLD_START_TIMEOUT_S=120) plus two 25s fallbacks totals ~178s, so the hook
+# would be killed mid-flight and EVERY side-effect tool rejected with
+# "pre_tool_call plugin callback timed out or is still running" until the agent
+# process restarted (gateway/router restarts do not clear it). Keep comfortably
+# under the hook bound; on exhaustion the gate fails to REVIEW as designed.
+TOTAL_BUDGET_S = float(os.environ.get("LAYA_TOOL_RISK_BUDGET", "20.0"))
+# Verdict cache: avoid re-asking the LLM for an identical (tool, display) op within TTL.
+# Keyed by (tool_name, display); value is (answers_dict, expiry_monotonic).
+_VERDICT_CACHE: Dict[str, tuple] = {}
+_VERDICT_CACHE_LOCK = threading.Lock()
+_VERDICT_CACHE_TTL = float(os.environ.get("LAYA_TOOL_RISK_CACHE_TTL", "300.0"))
+_VERDICT_CACHE_MAX = int(os.environ.get("LAYA_TOOL_RISK_CACHE_MAX", "1024"))
+# Minimum slice for an attempt to be worth making; below this -> skip the attempt.
+_MIN_ATTEMPT_S = 1.0
+# Reserve this much of the budget for the OpenRouter failover tiers so a slow
+# cold primary cannot starve them.
+_FALLBACK_RESERVE_S = float(os.environ.get("LAYA_FALLBACK_RESERVE", "8.0"))
 
 
 def _read_config() -> dict:
@@ -101,8 +141,8 @@ def _load_default_model() -> str:
     """Resolve the main profile's configured default model (provider/model).
 
     Reads config.yaml lazily so session-level `/model` switches are reflected
-    in the fallback tier. Returns "" on any failure so the caller escalates to
-    the approval gate instead of pinning a possibly-stale model.
+    in the fallback tier. Returns "" on any failure so the caller skips this tier
+    instead of pinning a possibly-stale model.
     """
     model = ((_read_config().get("model") or {}).get("default")) or ""
     return model if "/" in model else ""
@@ -159,7 +199,41 @@ SIDE_EFFECT_TOOLS = {
     "skill_manage", "cronjob_manage", "process_manage",
 }
 
-# Pure read/inspection terminal commands: pass deterministically, never call the LLM.
+# Backstop-aware terminal policy (O2). A fail-OPEN (allow-with-warning) is only safe when a
+# native Hermes floor/gate ALSO covers the tool on the ambiguous path, so an unverified op
+# still hits a deterministic or guardian check downstream:
+#   * terminal      -> HARDLINE + DANGEROUS_PATTERNS + Tirith + check_dangerous_command
+#   * execute_code  -> native _EXECUTE_CODE_GATE (approvals.mode=smart guardian)
+# Every OTHER side-effect tool has NO native per-tool LLM review (native write guards cover
+# only PROTECTED paths), so this plugin is the ONLY check: it must fail to REVIEW (escalate
+# to the human gate) instead of allowing the op unverified.
+FAIL_OPEN_TOOLS = {"terminal", "execute_code"}
+
+# Deterministic benign side-effect patterns: these never need an LLM round-trip.
+# Conservative: only clearly reversible dev operations. Destructive variants
+# (force-push, reset --hard, rm -rf) are handled by CATASTROPHIC_RE above.
+SAFE_SIDE_EFFECT_TERMINAL_RE = re.compile(
+    r"^(?:"
+    r"git\s+(?:commit|pull|fetch|checkout|switch|merge|rebase|stash|tag|add)\b"
+    r"|git\s+push\b(?![^\n]*--force\b)"
+    r"|pip3?\s+install\b|uv\s+(?:pip\s+)?install\b|npm\s+(?:install|ci|i)\b|yarn\s+add\b|pnpm\s+add\b"
+    r"|mkdir(?:\s+-p)?\s+\S"
+    r"|cp\s+-[a-zA-Z]*r?[a-zA-Z]*\s+\S+\s+\S+"
+    r"|mv\s+\S+\s+\S+"
+    r"|pytest\b|python3?\s+-m\s+pytest\b|make\b|cargo\s+(?:build|test|run)\b"
+    r"|touch\s+\S"
+    r")",
+    re.IGNORECASE,
+)
+
+# Write paths that are unambiguously user-owned project/content trees.
+_SAFE_WRITE_ROOTS = (
+    str(Path.home() / "src"),
+    str(Path.home() / "Desktop"),
+    str(Path.home() / "Documents"),
+    "/tmp",
+    str(Path.home() / ".hermes" / "skills"),
+)
 # Atomic tail: (?>...) commits to the first argument parse and never re-explores.
 # The original `(\s+([^>|;&]|'[^']*'|"[^"]*")*)?$` overlapped \s+ with the plain-char
 # class (whitespace) and blew up quadratically on commands with a long whitespace run
@@ -173,7 +247,7 @@ SAFE_TERMINAL_RE = re.compile(
     r"echo|cat|head|tail|grep|find|wc|sort|uniq|cut|tr|sed|awk|stat|file|tree|"
     r"git\s+(?:status|diff|log|branch|remote\s+-v|config|show|rev-parse)\b|"
     r"python3?\s+(?:"
-    r"/home/michael/\.hermes/scripts/|~/.hermes/scripts/|\$HOME/.hermes/scripts/|\.hermes/scripts/)"
+    r"~/.hermes/scripts/|\$HOME/.hermes/scripts/|\.hermes/scripts/)"
     r"\S+\.py\b)"
     r"(?>\s+(?:[^>|;&]+)*)?$"
 )
@@ -257,10 +331,30 @@ def _tool_name_and_args(kwargs: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
     return str(name), args
 
 
+_RTK_NATIVE_SUBCOMMANDS = frozenset({
+    "gain", "recall", "rewrite", "help", "version", "--help", "--version",
+    "init", "config",
+})
+
+
+def _unwrap_rtk(command: str) -> str:
+    """Strip a leading `rtk ` wrapper so the gate sees the wrapped command."""
+    s = command.strip()
+    if not s:
+        return s
+    parts = s.split(None, 2)
+    if len(parts) < 2 or parts[0] != "rtk":
+        return s
+    if parts[1] in _RTK_NATIVE_SUBCOMMANDS:
+        return s  # RTK's own command; evaluate as-is
+    return s[len("rtk"):].lstrip()
+
+
 def _command_display(tool_name: str, args: Dict[str, Any]) -> str:
     """Build a compact state string for the verifier."""
     if tool_name == "terminal":
-        return args.get("command") or args.get("cmd") or ""
+        cmd = args.get("command") or args.get("cmd") or ""
+        return _unwrap_rtk(cmd)
     if tool_name in ("write_file", "patch"):
         path = args.get("path", "")
         return f"{tool_name} on {path}"
@@ -281,7 +375,7 @@ def _log(entry: Dict[str, Any]) -> None:
 def _load_free_model() -> str:
     """Resolve the free-tier fallback model: env override > first `:free`
     entry in config `fallback_providers` > bundled default. Returns "" only if
-    nothing resolves (caller escalates to the human gate)."""
+    nothing resolves (caller then fails OPEN with a logged warning)."""
     if FREE_FALLBACK_MODEL_ENV:
         return FREE_FALLBACK_MODEL_ENV
     try:
@@ -338,12 +432,14 @@ def _post_verifier(
         return None, "unparseable"
 
 
-def _probe_health(base_url: str) -> bool:
+def _probe_health(base_url: str, timeout: Optional[float] = None) -> bool:
     """True if the router master responds on /health. The verifier URL is the
-    /v1/chat/completions endpoint; /health lives at the server root."""
+    /v1/chat/completions endpoint; /health lives at the server root. ``timeout``
+    caps the probe within the chain budget (defaults to HEALTH_TIMEOUT_S)."""
     try:
         root = base_url.rsplit("/v1/chat/completions", 1)[0]
-        return requests.get(f"{root}/health", timeout=HEALTH_TIMEOUT_S).status_code == 200
+        t = HEALTH_TIMEOUT_S if timeout is None else max(0.2, min(HEALTH_TIMEOUT_S, timeout))
+        return requests.get(f"{root}/health", timeout=t).status_code == 200
     except Exception:  # pragma: no cover
         return False
 
@@ -355,71 +451,189 @@ def _ask_verifier(display: str, tool_name: str) -> tuple[Optional[Dict[str, Any]
       1. local aux router (primary)
       2. main-profile default model via OpenRouter (paid)
       3. free-tier model via OpenRouter (config fallback_providers)
-      else None -> human approval gate (fail-to-REVIEW).
+      else None -> fail OPEN: the caller allows the op with a logged warning.
 
-    Cold-start split: if the primary timed out but the router master is UP,
-    retry ONCE with a long window (worker reloading after idle eviction) before
-    failing over. Router DOWN or any other error fails over immediately.
+    The WHOLE chain runs under a single ``TOTAL_BUDGET_S`` wall-clock deadline: every
+    per-tier timeout is clamped to the time remaining, and a tier is skipped when less
+    than ``_MIN_ATTEMPT_S`` is left. This keeps the callback inside the pre_tool_call
+    hook bound (plugins.hook_callback_timeout, default 30s) so a cold/absent verifier
+    degrades to a fast fail-OPEN instead of a timeout that blocks all tools.
+
+    Cold-start split: if the primary timed out but the router master is UP, retry ONCE
+    (bounded, and reserving budget for the failover tiers) before failing over. Router
+    DOWN or any other error fails over immediately.
 
     diag carries the per-attempt trail for the decisions log: attempts=[] of
-    {model, url, error}, plus cold_retry:True when the long retry fired.
+    {model, url, error}, plus cold_retry:True when the long retry fired, budget_s and
+    elapsed_s.
     """
     verifier_url, verifier_model = _resolve_verifier()
-    diag: Dict[str, Any] = {"attempts": []}
+    diag: Dict[str, Any] = {"attempts": [], "budget_s": TOTAL_BUDGET_S}
+    deadline = time.monotonic() + TOTAL_BUDGET_S
+
+    def remaining() -> float:
+        return deadline - time.monotonic()
+
+    def slice_for(configured: float, reserve: float = 0.0) -> float:
+        """Per-attempt timeout clamped by what is left in the chain budget."""
+        return min(configured, remaining() - reserve)
+
+    def _done(ans: Optional[Dict[str, Any]]):
+        diag["elapsed_s"] = round(TOTAL_BUDGET_S - remaining(), 2)
+        return ans, diag
 
     # Tier 1: local aux router (primary).
-    answers, err = _post_verifier(
-        verifier_url, verifier_model, TIMEOUT_S, "llama", display, tool_name
-    )
+    t = slice_for(TIMEOUT_S)
+    if t >= _MIN_ATTEMPT_S:
+        answers, err = _post_verifier(
+            verifier_url, verifier_model, t, "llama", display, tool_name
+        )
+    else:
+        answers, err = None, "budget-exhausted"
     diag["attempts"].append({"model": verifier_model, "url": verifier_url, "error": err})
     if answers is not None:
-        return answers, diag
+        return _done(answers)
 
-    # Cold-start split: timeout on a healthy router = worker reloading after
-    # idle eviction (40-90s on this box) — one long retry before failover.
-    if err == "timeout" and _probe_health(verifier_url):
+    # Cold-start split: timeout on a healthy router = worker reloading after idle
+    # eviction (40-90s on this box) — one retry, clamped to the budget minus the
+    # reserve kept for the failover tiers.
+    if (
+        err == "timeout"
+        and remaining() - _FALLBACK_RESERVE_S >= _MIN_ATTEMPT_S
+        and _probe_health(verifier_url, remaining())
+    ):
+        cold = slice_for(COLD_START_TIMEOUT_S, _FALLBACK_RESERVE_S)
         logger.warning(
             "laya-tool-risk: verifier cold-start (timeout on healthy router), "
-            "retrying with %ss window", COLD_START_TIMEOUT_S,
+            "retrying with %.0fs window (chain budget %.0fs)", cold, TOTAL_BUDGET_S,
         )
         answers, err2 = _post_verifier(
-            verifier_url, verifier_model, COLD_START_TIMEOUT_S, "llama", display, tool_name
+            verifier_url, verifier_model, cold, "llama", display, tool_name
         )
         diag["cold_retry"] = True
         diag["attempts"].append({"model": verifier_model, "url": verifier_url, "error": err2})
         if answers is not None:
-            return answers, diag
+            return _done(answers)
+
+    fallback_url = _resolve_fallback_url()
+
+    def _failover(model: str, note: str) -> Optional[Dict[str, Any]]:
+        t = slice_for(FALLBACK_TIMEOUT_S)
+        if not model or not fallback_url or t < _MIN_ATTEMPT_S:
+            diag["attempts"].append({"model": model or "?", "url": fallback_url,
+                                     "error": "skipped-budget"})
+            return None
+        logger.warning("laya-tool-risk: %s", note)
+        a, e = _post_verifier(
+            fallback_url, model, t, _load_fallback_api_key(), display, tool_name
+        )
+        diag["attempts"].append({"model": model, "url": fallback_url, "error": e})
+        return a
 
     # Tier 2: main profile default model (paid OpenRouter).
     fallback_model = FALLBACK_MODEL_ENV or _load_default_model()
-    fallback_url = _resolve_fallback_url()
     if fallback_url and fallback_model:
-        logger.warning(
-            "laya-tool-risk: primary verifier unavailable, falling back to %s", fallback_model
-        )
-        answers, err2 = _post_verifier(
-            fallback_url, fallback_model, FALLBACK_TIMEOUT_S,
-            _load_fallback_api_key(), display, tool_name,
-        )
-        diag["attempts"].append({"model": fallback_model, "url": fallback_url, "error": err2})
-        if answers is not None:
-            return answers, diag
+        a = _failover(fallback_model, f"primary verifier unavailable, falling back to {fallback_model}")
+        if a is not None:
+            return _done(a)
 
     # Tier 3: free-tier model (config fallback_providers, e.g. gemma free).
     free_model = _load_free_model()
     if fallback_url and free_model:
-        logger.warning(
-            "laya-tool-risk: default failover unavailable, trying free tier %s", free_model
-        )
-        answers, err2 = _post_verifier(
-            fallback_url, free_model, FALLBACK_TIMEOUT_S,
-            _load_fallback_api_key(), display, tool_name,
-        )
-        diag["attempts"].append({"model": free_model, "url": fallback_url, "error": err2})
-        if answers is not None:
-            return answers, diag
+        a = _failover(free_model, f"default failover unavailable, trying free tier {free_model}")
+        if a is not None:
+            return _done(a)
 
-    return None, diag
+    return _done(None)
+
+
+# --- Fail-open surfacing (chat-visible warning) ------------------------------
+# pre_tool_call can only attach a message to block/approve (an ALLOW is a bare None), so a
+# fail-open records its warning here keyed by tool_call_id; transform_tool_result -- whose
+# return string the CLI renders -- prepends it to that call's result.
+_FAILOPEN_NOTES: Dict[str, str] = {}
+_FAILOPEN_LOCK = threading.Lock()
+_FAILOPEN_MAX = 256
+
+
+def _emit_cli_warning(note: str) -> None:
+    """Best-effort live warning line in the interactive CLI.
+
+    Uses the CLI's own renderer (``cli._cprint``), which routes through prompt_toolkit so the
+    line lands in the scrollback cleanly and survives the live prompt/thread. A no-op in
+    gateway/TUI/headless (no ``cli`` module / no live app) -- the logger + decisions.jsonl
+    remain the record there."""
+    try:
+        from cli import _cprint  # type: ignore
+        _cprint(f"\x1b[1;33m  \u26a0 {note}\x1b[0m")
+    except Exception:
+        pass
+
+
+def _record_failopen(kwargs: Dict[str, Any], tool_name: str, display: str, why: str) -> None:
+    note = (f"WARNING (laya-tool-risk): allowed WITHOUT verification ({why}) -- "
+            f"{tool_name}: {display[:160]}")
+    _emit_cli_warning(note)
+    tcid = str(kwargs.get("tool_call_id") or "")
+    if not tcid:
+        return
+    with _FAILOPEN_LOCK:
+        if len(_FAILOPEN_NOTES) >= _FAILOPEN_MAX:
+            for k in list(_FAILOPEN_NOTES)[: _FAILOPEN_MAX // 4]:
+                _FAILOPEN_NOTES.pop(k, None)
+        _FAILOPEN_NOTES[tcid] = note
+
+
+def _unverified_action(kwargs: Dict[str, Any], tool_name: str, display: str,
+                       why: str, tag: str, diag: Optional[Dict[str, Any]] = None
+                       ) -> Optional[Dict[str, Any]]:
+    """Terminal state when the whole verifier chain yields no verdict.
+
+    Backstop-aware (O2): tools a native floor/gate also covers (FAIL_OPEN_TOOLS) fail OPEN with
+    a warning; every other side-effect tool fails to REVIEW -- return the ``approve`` directive,
+    which the host routes through the human-approval gate (fail-closed: a gate error/deny/timeout
+    blocks). Keeps the plugin's only-check tools from running unverified during an outage without
+    re-adding prompt noise on the backstopped path.
+    """
+    entry = {"ts": time.monotonic(), "tool": tool_name, "op": display[:200], "reason": why}
+    if diag is not None:
+        entry["diag"] = diag
+    if tool_name in FAIL_OPEN_TOOLS:
+        _log(dict(entry, action="allow", via=f"verifier-{tag}-failopen"))
+        logger.warning(
+            "laya-tool-risk: FAILING OPEN (allowing %s) — %s (backstopped by native floors). "
+            "Op: %s", tool_name, why, display[:200],
+        )
+        _record_failopen(kwargs, tool_name, display, why)
+        return None
+    _log(dict(entry, action="escalate", via=f"verifier-{tag}-review"))
+    logger.warning(
+        "laya-tool-risk: FAILING TO REVIEW (escalating %s) — %s; no native backstop for this "
+        "tool. Op: %s", tool_name, why, display[:200],
+    )
+    return {
+        "action": "approve",
+        "rule_key": f"laya-unverified-{tool_name}",
+        "message": (
+            f"laya-tool-risk: could not verify this {tool_name} call ({why}); escalating for "
+            f"human review. Op: {display[:200]}"
+        ),
+    }
+
+
+def on_transform_tool_result(*args: Any, **kwargs: Any) -> Optional[str]:
+    """Prepend a recorded fail-open warning to this call's result (chat-visible)."""
+    tcid = str(kwargs.get("tool_call_id") or "")
+    if not tcid:
+        return None
+    with _FAILOPEN_LOCK:
+        note = _FAILOPEN_NOTES.pop(tcid, None)
+    if not note:
+        return None
+    result = kwargs.get("result")
+    if not isinstance(result, str):
+        return None
+    return f"{note}\n\n{result}"
 
 
 def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
@@ -450,8 +664,14 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
                 "message": (
                     f"laya-tool-risk: BLOCKED — command matches a catastrophic pattern: "
                     f"{display[:200]}. Ask the user before running anything like this."
+                    + (" Prefer `gio trash` for reversible deletion." if "rm" in display.lower() else "")
                 ),
             }
+        # Deterministic benign side-effect pass (no LLM round-trip).
+        if SAFE_SIDE_EFFECT_TERMINAL_RE.match(display.strip()):
+            _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "allow",
+                  "via": "safe-side-effect-re"})
+            return None
     elif SENSITIVE_WRITE_RE.match(display.strip()):
         _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "block",
               "via": "sensitive-write-re"})
@@ -462,23 +682,43 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
                 f"{display[:200]}."
             ),
         }
+    elif tool_name in ("write_file", "patch"):
+        path = (tool_args.get("path") or "").strip()
+        if path and any(path == root or path.startswith(root + "/") for root in _SAFE_WRITE_ROOTS):
+            _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "allow",
+                  "via": "safe-write-path"})
+            return None
 
-    answers, diag = _ask_verifier(display, tool_name)
-    rkey = f"laya-tool-risk:{tool_name}"
+    # Verdict cache: reuse a recent verdict for an identical op instead of re-asking the LLM.
+    cache_key = f"{tool_name}\x00{display}"
+    now = time.monotonic()
+    with _VERDICT_CACHE_LOCK:
+        cached = _VERDICT_CACHE.get(cache_key)
+        if cached is not None and cached[1] > now:
+            answers = cached[0]
+            diag = {"attempts": [], "cached": True}
+            # skip verifier call
+            _cached = True
+        else:
+            _cached = False
+    if _cached:
+        pass
+    else:
+        answers, diag = _ask_verifier(display, tool_name)
+        if answers is not None:
+            with _VERDICT_CACHE_LOCK:
+                if len(_VERDICT_CACHE) >= _VERDICT_CACHE_MAX:
+                    # evict oldest by expiry
+                    oldest = min(_VERDICT_CACHE.items(), key=lambda kv: kv[1][1])[0]
+                    _VERDICT_CACHE.pop(oldest, None)
+                _VERDICT_CACHE[cache_key] = (answers, now + _VERDICT_CACHE_TTL)
     if answers is None:
-        # Verifier down: fail-to-REVIEW only for ops that passed both deterministic
-        # layers (genuinely ambiguous). Safe reads and catastrophes already resolved.
-        _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "escalate",
-              "via": "verifier-down", "diag": diag})
-        return {
-            "action": "approve",
-            "message": (
-                "laya-tool-risk: verifier unavailable — routing to approval before executing "
-                f"side-effect operation {tool_name}. Check the aux router/verifier config "
-                "if this persists."
-            ),
-            "rule_key": rkey,
-        }
+        # No verdict from the whole chain. Deterministic layers above already ran; handle the
+        # terminal state backstop-aware (O2): backstopped tools fail open, the rest fail to
+        # review. diag (per-attempt trail) rides the decisions.jsonl entry via the helper.
+        return _unverified_action(
+            kwargs, tool_name, display, "verifier unavailable", "down", diag
+        )
 
     risk = str(answers.get("risk", "")).lower()
     try:
@@ -497,6 +737,7 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
                 f"laya-tool-risk: BLOCKED — verifier classified as high risk: {reason} "
                 f"(confidence {conf:.2f}). Re-read the goal and re-issue with a safer "
                 "approach, or ask the user to run it manually."
+                + (" Prefer `gio trash` for reversible deletion." if "rm" in display.lower() else "")
             ),
         }
     if risk in ("low", "medium") and conf >= ALLOW_MAX_CONF:
@@ -504,23 +745,19 @@ def on_pre_tool_call(*args: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
               "via": "verifier", "risk": risk, "conf": conf, "reason": reason})
         return None
 
-    # Unknown risk label or low confidence on a non-catastrophic op: escalate (rare).
-    _log({"ts": t0, "tool": tool_name, "op": display[:200], "action": "escalate",
-          "via": "verifier-ambiguous", "risk": risk, "conf": conf, "reason": reason})
-    return {
-        "action": "approve",
-        "message": (
-            f"laya-tool-risk: ambiguous verdict (risk={risk}, confidence={conf:.2f}) — "
-            f"confirm this side-effect operation: {reason}"
-        ),
-        "rule_key": rkey,
-    }
+    # Unknown risk label or low confidence on a non-catastrophic op: backstop-aware terminal
+    # state (O2). Deterministic blocks above already ran.
+    return _unverified_action(
+        kwargs, tool_name, display,
+        f"ambiguous verdict risk={risk} conf={conf:.2f}: {reason}", "ambiguous",
+    )
 
 
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_tool_call", on_pre_tool_call)
+    ctx.register_hook("transform_tool_result", on_transform_tool_result)
     verifier_url, verifier_model = _resolve_verifier()
     logger.info(
-        "laya-tool-risk v2 registered pre_tool_call hook (verifier=%s@%s)",
+        "laya-tool-risk v2.4 registered pre_tool_call + transform_tool_result hooks (verifier=%s@%s)",
         verifier_model, verifier_url,
     )
